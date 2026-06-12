@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ET — GPU Trace Diagnosis</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="header">
+        <h1>ET</h1>
+        <p class="subtitle">Upload a PyTorch Profiler <code>.json</code> trace for a GPU idleness verdict.</p>
+      </header>
+
+      <section
+        id="dropzone"
+        class="dropzone"
+        tabindex="0"
+        aria-label="Upload trace file"
+      >
+        <input
+          type="file"
+          id="file-input"
+          accept=".json,.json.gz,application/json"
+          hidden
+        />
+        <div class="dropzone-inner">
+          <p class="dropzone-title">Drop trace here</p>
+          <p class="dropzone-hint">or click to browse · <code>.json</code> / <code>.json.gz</code></p>
+        </div>
+      </section>
+
+      <p id="status" class="status" hidden></p>
+
+      <section id="results" class="results" hidden>
+        <article id="verdict-card" class="verdict-card">
+          <p class="verdict-label">Verdict</p>
+          <h2 id="verdict-text" class="verdict-text"></h2>
+          <p id="confidence" class="confidence"></p>
+          <p id="summary" class="summary"></p>
+        </article>
+
+        <section class="panel">
+          <h3>Evidence</h3>
+          <ul id="evidence-list" class="evidence-list"></ul>
+          <dl id="metrics-dl" class="metrics-dl"></dl>
+        </section>
+
+        <section class="panel" id="actions-panel" hidden>
+          <h3>Recommended actions</h3>
+          <ol id="actions-list" class="actions-list"></ol>
+        </section>
+
+        <details class="explain" id="explain-section">
+          <summary>Per-rule decision log (--explain)</summary>
+          <div class="explain-body">
+            <table class="attrib-table" id="attrib-table">
+              <thead>
+                <tr>
+                  <th>Metric</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody id="attrib-body"></tbody>
+            </table>
+            <h4 class="decisions-heading">Detector decisions</h4>
+            <table class="decisions-table" id="decisions-table">
+              <thead>
+                <tr>
+                  <th>Rule</th>
+                  <th>Value</th>
+                  <th>Threshold</th>
+                  <th>Status</th>
+                  <th>Note</th>
+                </tr>
+              </thead>
+              <tbody id="decisions-body"></tbody>
+            </table>
+          </div>
+        </details>
+
+        <p class="trace-meta" id="trace-meta"></p>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

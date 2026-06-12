@@ -1,0 +1,44 @@
+[project]
+name = "gpu-doctor-agent"
+version = "0.1.0"
+description = "Always-on sampling spine for ET's live GPU observability agent (Product A)."
+readme = "README.md"
+authors = [
+    { name = "devan-p", email = "devanapatel@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.25.1",
+    "rich>=15.0.0",
+    "pynvml>=12.0.0",
+    "gpu-doctor-engine",
+]
+keywords = ["gpu", "observability", "nvml", "monitoring", "ml-infrastructure"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/devan-p/ET"
+Issues = "https://github.com/devan-p/ET/issues"
+
+[project.scripts]
+gpu-doctor-agent = "gpu_doctor_agent.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.uv.sources]
+gpu-doctor-engine = { path = "../engine" }

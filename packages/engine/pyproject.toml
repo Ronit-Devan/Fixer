@@ -1,0 +1,46 @@
+[project]
+name = "gpu-doctor-engine"
+version = "0.3.0"
+description = "ET diagnostic engine for identifying GPU training bottlenecks from PyTorch Profiler traces."
+readme = "README.md"
+authors = [
+    { name = "devan-p", email = "devanapatel@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "pydantic>=2.13.4",
+    "rich>=15.0.0",
+    "typer>=0.25.1",
+]
+keywords = ["gpu", "pytorch", "profiler", "diagnostic", "ml-infrastructure", "observability"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Repository = "https://github.com/devan-p/ET"
+Issues = "https://github.com/devan-p/ET/issues"
+
+[project.scripts]
+gpu-doctor = "gpu_doctor_engine.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.13,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pre-commit>=4.6.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.12",
+]

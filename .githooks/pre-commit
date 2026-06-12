@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Refuse commits containing unresolved merge-conflict markers.
+if ! git diff --cached --check; then
+  echo "✖ Commit blocked: conflict markers or whitespace errors in staged changes."
+  exit 1
+fi
+if git diff --cached -U0 | grep -E '^\+(<<<<<<<|>>>>>>>)' >/dev/null; then
+  echo "✖ Commit blocked: merge-conflict markers in staged changes."
+  exit 1
+fi

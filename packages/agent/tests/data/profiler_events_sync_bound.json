@@ -1,0 +1,15 @@
+{
+  "_comment": "Hand-authored fixture: 10 profiler-event dicts mirroring the shape that build_sync_bound_events() produces (5 CUDA kernels + 5 CPU aten::item sync calls), in the dict shape that _function_event_to_portable_dict emits. Wired into tests/test_torch_source.py: convert_function_events(this list) -> engine Events -> attribute() -> diagnose() must yield Verdict.SYNC_BOUND. That proves the torch path lands at the same engine seam as the mock + file paths. Kernel dur (8000us) clears avg_kernel_dur>=50us guard; 5 kernels clears warmup_trace_guard; aten::item ending exactly at idle-start makes sync_fraction=1.0 which clears the >=0.25 threshold.",
+  "events": [
+    {"name": "volta_sgemm",  "device_type": "DeviceType.CUDA", "ts":      0, "dur": 8000, "tid": 1},
+    {"name": "aten::item",   "device_type": "DeviceType.CPU",  "ts":   7900, "dur":  100, "tid": 0},
+    {"name": "volta_sgemm",  "device_type": "DeviceType.CUDA", "ts":  40000, "dur": 8000, "tid": 1},
+    {"name": "aten::item",   "device_type": "DeviceType.CPU",  "ts":  47900, "dur":  100, "tid": 0},
+    {"name": "volta_sgemm",  "device_type": "DeviceType.CUDA", "ts":  80000, "dur": 8000, "tid": 1},
+    {"name": "aten::item",   "device_type": "DeviceType.CPU",  "ts":  87900, "dur":  100, "tid": 0},
+    {"name": "volta_sgemm",  "device_type": "DeviceType.CUDA", "ts": 120000, "dur": 8000, "tid": 1},
+    {"name": "aten::item",   "device_type": "DeviceType.CPU",  "ts": 127900, "dur":  100, "tid": 0},
+    {"name": "volta_sgemm",  "device_type": "DeviceType.CUDA", "ts": 160000, "dur": 8000, "tid": 1},
+    {"name": "aten::item",   "device_type": "DeviceType.CPU",  "ts": 167900, "dur":  100, "tid": 0}
+  ]
+}

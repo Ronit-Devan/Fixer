@@ -1,0 +1,13 @@
+{
+  "verdict": "healthy",
+  "confidence": 0.75,
+  "summary": "GPU utilization is 75%. No dominant bottleneck \u2014 training looks healthy.",
+  "evidence": [
+    "GPU busy time: 1760.5ms",
+    "GPU idle time: 587.5ms (25%)"
+  ],
+  "recommended_actions": [],
+  "metrics": {
+    "gpu_util": 0.7475945389302928
+  }
+}

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ET · GPU utilization report</title>
+  <style>
+    :root { --ink:#11151c; --muted:#5e6878; --line:#e3e8ef; --accent:#2f6df6; --warn:#d97706; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#f4f6f9; color:var(--ink);
+      font-family: ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+    .sheet { max-width:820px; margin:28px auto; background:#fff; border:1px solid var(--line);
+      border-radius: 0; padding:40px 46px; box-shadow:0 6px 30px rgba(20,30,50,.07); }
+    header { display:flex; justify-content:space-between; align-items:flex-start; border-bottom:2px solid var(--ink); padding-bottom:16px; }
+    .logo { font-weight:800; background:var(--accent); color:#fff; padding:5px 10px; border-radius: 0; letter-spacing:.5px; }
+    h1 { font-size:22px; margin:18px 0 2px; }
+    .sub { color:var(--muted); font-size:13px; }
+    .hero { display:flex; gap:16px; margin:26px 0; }
+    .big { flex:1; border:1px solid var(--line); border-radius: 0; padding:18px 20px; }
+    .big .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+    .big .val { font-size:34px; font-weight:800; margin-top:6px; }
+    .big .val.warn { color:var(--warn); }
+    table { width:100%; border-collapse:collapse; margin-top:8px; }
+    th, td { text-align:left; padding:9px 6px; border-bottom:1px solid var(--line); font-size:14px; }
+    th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+    td.num, th.num { text-align:right; }
+    .bar { height:7px; background:#eef1f6; border-radius: 0; overflow:hidden; }
+    .bar span { display:block; height:100%; background:var(--accent); }
+    .opp { margin:22px 0 4px; padding:16px 18px; background:#fffbeb; border:1px solid #fde68a; border-left:3px solid var(--warn); font-size:15px; line-height:1.5; }
+    .opp b { color:var(--warn); }
+    h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin:30px 0 6px; }
+    .actions { margin:24px 0 4px; }
+    button { background:var(--accent); color:#fff; border:0; padding:10px 18px; border-radius: 0; font-size:14px; cursor:pointer; }
+    footer { color:var(--muted); font-size:12px; margin-top:30px; border-top:1px solid var(--line); padding-top:14px; }
+    @media print { body { background:#fff; } .sheet { box-shadow:none; border:0; margin:0; } .actions { display:none; } }
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <header>
+      <div>
+        <span class="logo">ET</span>
+        <h1>GPU Utilization Report</h1>
+        <div class="sub" id="sub">-</div>
+      </div>
+      <div class="sub" id="period" style="text-align:right"></div>
+    </header>
+
+    <div class="hero">
+      <div class="big"><div class="label">GPU idle</div><div class="val warn" id="idle">-</div><div class="bar"><span id="idlebar"></span></div></div>
+      <div class="big"><div class="label">Avg utilization</div><div class="val" id="avg">-</div></div>
+      <div class="big"><div class="label">Est. idle cost / month</div><div class="val warn" id="permo">-</div></div>
+    </div>
+
+    <div id="opportunity" class="opp"></div>
+
+    <h2>Cost of idle</h2>
+    <table id="cost"></table>
+
+    <h2>Where the time went</h2>
+    <table id="breakdown"><thead><tr><th>State</th><th class="num">Time</th><th class="num">Share</th></tr></thead><tbody></tbody></table>
+
+    <div class="actions"><button onclick="window.print()">Print / Save as PDF</button></div>
+
+    <footer>Generated locally by ET Inference Monitor. Idle cost is an estimate based on the configured GPU $/hr; not a bill.</footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const money = (v) => v == null ? "-" : "$" + Number(v).toLocaleString(undefined, { maximumFractionDigits: v < 100 ? 2 : 0 });
+    const dur = (s) => { s = Math.round(s); const h = Math.floor(s/3600), m = Math.floor((s%3600)/60); return h ? `${h}h ${m}m` : `${m}m ${s%60}s`; };
+    const dt = (s) => new Date(s * 1000).toLocaleString();
+    const title = (v) => v.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+    fetch("/api/report").then((r) => r.json()).then((d) => {
+      $("sub").textContent = d.gpu_name;
+      $("period").innerHTML = `${dt(d.started_at_s)}<br>→ ${dt(d.generated_at_s)}<br>(${d.uptime_hours} h)`;
+      $("idle").textContent = Math.round(d.idle_fraction * 100) + "%";
+      $("idlebar").style.width = Math.min(100, d.idle_fraction * 100) + "%";
+      $("avg").textContent = Math.round(d.avg_util_pct) + "%";
+      $("permo").textContent = d.gpu_hourly_usd > 0 ? money(d.projected_monthly_idle_usd) : "set $/hr";
+
+      // Optimization opportunity: turn idle into a reclaimable savings number.
+      const opp = $("opportunity");
+      const idlePct = Math.round(d.idle_fraction * 100);
+      if (d.gpu_hourly_usd > 0 && idlePct > 0) {
+        opp.innerHTML = `<b>Optimization opportunity:</b> this GPU was idle <b>${idlePct}%</b> of the time. `
+          + `Cutting that idle could reclaim up to <b>${money(d.projected_monthly_idle_usd)}/mo</b> `
+          + `(${money(d.projected_yearly_idle_usd)}/yr) on this one card. See "Where the time went" below for what to act on.`;
+      } else {
+        opp.style.display = "none";
+      }
+
+      $("cost").innerHTML = d.gpu_hourly_usd > 0 ? `
+        <tr><td>GPU rate</td><td class="num">$${d.gpu_hourly_usd}/hr</td></tr>
+        <tr><td>Idle time this session</td><td class="num">${d.idle_hours} h</td></tr>
+        <tr><td>Wasted on idle (so far)</td><td class="num">${money(d.wasted_usd_so_far)}</td></tr>
+        <tr><td>Projected / month</td><td class="num">${money(d.projected_monthly_idle_usd)}</td></tr>
+        <tr><td>Projected / year</td><td class="num">${money(d.projected_yearly_idle_usd)}</td></tr>`
+        : `<tr><td>Run with <code>--gpu-price &lt;$/hr&gt;</code> to estimate idle cost.</td><td class="num">-</td></tr>`;
+
+      const tb = $("breakdown").querySelector("tbody");
+      tb.innerHTML = d.verdict_breakdown.map((b) =>
+        `<tr><td>${title(b.verdict)}</td><td class="num">${dur(b.seconds)}</td><td class="num">${Math.round(b.fraction * 100)}%</td></tr>`
+      ).join("") || `<tr><td colspan="3">No data yet.</td></tr>`;
+    });
+  </script>
+</body>
+</html>

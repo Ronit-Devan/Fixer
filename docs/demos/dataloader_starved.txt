@@ -1,0 +1,20 @@
+╭────────────────────────────────── Verdict ───────────────────────────────────╮
+│ DATALOADER_BOUND  (confidence: 95%)                                          │
+│                                                                              │
+│ GPU is 16% utilized. The dominant cause is dataloader stalls: 7416ms (99%)   │
+│ of GPU idle time overlaps with PyTorch DataLoader activity on the CPU.       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+                Evidence                 
+┌───────────────────────────────────────┐
+│   GPU utilization: 16%                │
+│   Total GPU idle: 7481ms              │
+│   Dataloader time during idle: 7416ms │
+└───────────────────────────────────────┘
+
+Recommended actions:
+  1. Increase DataLoader num_workers (try 4 or 8).
+  2. Set persistent_workers=True to avoid worker re-spawn.
+  3. Set pin_memory=True for faster H2D transfer.
+  4. Move expensive preprocessing to a separate process or use an iterable 
+dataset.
+  5. Profile your __getitem__ and look for slow image decode or disk reads.

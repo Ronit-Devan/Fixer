@@ -1,0 +1,16 @@
+╭────────────────────────────────── Verdict ───────────────────────────────────╮
+│ PCIE_BOUND  (confidence: 86%)                                                │
+│                                                                              │
+│ GPU is 2% utilized. Host-device transfers dominate: 634ms in cuMemcpy.       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+        Evidence         
+┌───────────────────────┐
+│   GPU utilization: 2% │
+│   Memcpy time: 634ms  │
+└───────────────────────┘
+
+Recommended actions:
+  1. Use pin_memory=True in DataLoader.
+  2. Use non_blocking=True on .to(device) calls.
+  3. Batch larger transfers instead of many small ones.
+  4. Consider keeping intermediate tensors on GPU.

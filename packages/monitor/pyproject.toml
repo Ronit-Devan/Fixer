@@ -1,0 +1,36 @@
+[project]
+name = "et-gpu-monitor"
+version = "0.1.0"
+description = "Live GPU idleness + llama.cpp inference monitor: a local web app you run on the box serving the model."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "devan-p", email = "devanapatel@gmail.com" }]
+license = { text = "MIT" }
+keywords = ["gpu", "llama.cpp", "inference", "observability", "idleness", "monitoring"]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+
+[project.optional-dependencies]
+# Real NVIDIA telemetry without shelling out to nvidia-smi. Optional: the app
+# falls back to nvidia-smi, then to mock data, if this isn't installed.
+gpu = ["nvidia-ml-py>=12.535"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6"]
+
+[project.scripts]
+et-monitor = "et_monitor.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/devan-p/ET"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/et_monitor"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

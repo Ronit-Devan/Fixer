@@ -1,0 +1,40 @@
+# Build context for the agent image (packages/agent/ when built with the
+# named-context invocation in Dockerfile). Keep the runtime image lean.
+
+# Python bytecode + tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local development venv — the image builds its own fresh venv.
+.venv/
+
+# VCS — runtime doesn't need git history.
+.git/
+.gitignore
+.gitattributes
+
+# Tests and any test inputs (including PyTorch-profiler JSON traces — none
+# are needed at runtime; the live agent ingests traces via --trace-file
+# from a mounted volume, not from the image).
+tests/
+*.json
+
+# Docs / licenses — not consumed at runtime.
+docs/
+*.md
+LICENSE
+
+# Deployment artifacts package the image, they don't ship inside it.
+deploy/
+Dockerfile
+.dockerignore
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

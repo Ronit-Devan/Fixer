@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ET · Inference Monitor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">ET</span>
+      <div class="brand-text">
+        <strong>Inference Monitor</strong>
+        <span class="sub" id="gpu-name">-</span>
+      </div>
+    </div>
+    <div class="pills">
+      <span class="pill" id="pill-conn"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></span>
+      <span class="pill" id="pill-llama">llama-server: -</span>
+      <span class="pill" id="pill-backend">backend: -</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero: verdict + cost -->
+    <section class="hero">
+      <div class="card verdict" id="verdict-card">
+        <div class="verdict-head">
+          <span class="badge" id="verdict-badge">starting</span>
+          <span class="conf" id="verdict-conf"></span>
+        </div>
+        <h1 id="verdict-title">Starting up…</h1>
+        <p id="verdict-summary" class="lede">Collecting the first samples; this takes a few seconds.</p>
+        <div class="recs-wrap" id="recs-wrap" hidden>
+          <div class="recs-label">What to do</div>
+          <ul id="verdict-recs" class="recs"></ul>
+        </div>
+      </div>
+
+      <div class="card cost">
+        <div class="cost-label">GPU idle · this session</div>
+        <div class="cost-big" id="idle-frac">-</div>
+        <div class="cost-bar"><span id="idle-bar"></span></div>
+        <hr />
+        <div class="cost-label">Estimated cost of idle</div>
+        <div class="cost-row"><span>So far</span><strong id="wasted-so-far">-</strong></div>
+        <div class="cost-row"><span>Projected / month</span><strong id="proj-monthly" class="warn">-</strong></div>
+        <div class="cost-note" id="cost-note">run with a $/hr rate to estimate cost</div>
+      </div>
+    </section>
+
+    <!-- Live tiles -->
+    <section class="tiles">
+      <div class="tile"><div class="tile-label">GPU util</div><div class="tile-val" id="t-util">-</div></div>
+      <div class="tile"><div class="tile-label">VRAM</div><div class="tile-val" id="t-mem">-</div><div class="tile-sub" id="t-mem-sub"></div></div>
+      <div class="tile"><div class="tile-label">Power</div><div class="tile-val" id="t-power">-</div></div>
+      <div class="tile"><div class="tile-label">Gen tok/s</div><div class="tile-val" id="t-tps">-</div></div>
+      <div class="tile"><div class="tile-label">Requests</div><div class="tile-val" id="t-req">-</div></div>
+      <div class="tile"><div class="tile-label">KV cache</div><div class="tile-val" id="t-kv">-</div></div>
+    </section>
+
+    <!-- Charts -->
+    <section class="charts">
+      <div class="card chart-card">
+        <div class="chart-title">GPU utilization <span>%</span></div>
+        <canvas id="chart-util" height="150"></canvas>
+      </div>
+      <div class="card chart-card">
+        <div class="chart-title">VRAM used <span>%</span></div>
+        <canvas id="chart-mem" height="150"></canvas>
+      </div>
+      <div class="card chart-card">
+        <div class="chart-title">Generation throughput <span>tok/s</span></div>
+        <canvas id="chart-tps" height="150"></canvas>
+      </div>
+      <div class="card chart-card">
+        <div class="chart-title">KV cache usage <span>%</span></div>
+        <canvas id="chart-kv" height="150"></canvas>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span id="uptime">-</span>
+      <span class="footer-brand">
+        <a href="/report" target="_blank" class="report-link">View / print report →</a>
+        · ET runs locally, nothing leaves this machine
+      </span>
+    </footer>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

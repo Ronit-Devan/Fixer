@@ -1,0 +1,20 @@
+{
+  "verdict": "pcie_bound",
+  "confidence": 0.8592644729418912,
+  "summary": "GPU is 2% utilized. Host-device transfers dominate: 634ms in cuMemcpy.",
+  "evidence": [
+    "GPU utilization: 2%",
+    "Memcpy time: 634ms"
+  ],
+  "recommended_actions": [
+    "Use pin_memory=True in DataLoader.",
+    "Use non_blocking=True on .to(device) calls.",
+    "Batch larger transfers instead of many small ones.",
+    "Consider keeping intermediate tensors on GPU."
+  ],
+  "metrics": {
+    "gpu_util": 0.02288133500435247,
+    "memcpy_us": 633601,
+    "idle_us": 3797980
+  }
+}

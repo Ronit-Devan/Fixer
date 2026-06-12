@@ -1,0 +1,209 @@
+# ET sampling-spine DaemonSet — kind / CI validation profile.
+#
+# This manifest deploys the agent as one pod per node in Tier-1 + mock
+# attribution mode. It needs no GPU, no NVML on the host, and no
+# privileged capabilities. The intent is to prove the rollout shape
+# (DaemonSet topology, resource ceilings, lifecycle, security context)
+# end-to-end before live attribution is wired in.
+#
+# The "real GPU cluster" changes are listed at the bottom of this file
+# and in deploy/README.md. They are explicitly NOT enabled here.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: et-system
+  labels:
+    app.kubernetes.io/name: et-agent
+    app.kubernetes.io/part-of: et
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: et-agent
+  namespace: et-system
+  labels:
+    app.kubernetes.io/name: et-agent
+    app.kubernetes.io/part-of: et
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: et-agent
+  namespace: et-system
+  labels:
+    app.kubernetes.io/name: et-agent
+    app.kubernetes.io/part-of: et
+    app.kubernetes.io/component: sampler-spine
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: et-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: et-agent
+        app.kubernetes.io/part-of: et
+        app.kubernetes.io/component: sampler-spine
+    spec:
+      serviceAccountName: et-agent
+
+      # The agent's SIGTERM handler trips a shutdown flag that the loop
+      # checks once per sample tick (default 1.0s) before flushing a
+      # final summary line. 30s leaves comfortable headroom over that
+      # tick + a slow Python interpreter teardown.
+      terminationGracePeriodSeconds: 30
+
+      # ---------------------------------------------------------------
+      # GPU-node targeting — INERT on kind / non-GPU clusters.
+      # On a real cluster (NVIDIA GPU Operator or Node Feature Discovery
+      # labeling the nodes), uncomment the nodeSelector below. Pair it
+      # with the NVML mount + `--no-mock` args change listed at the
+      # bottom of this file.
+      # ---------------------------------------------------------------
+      # nodeSelector:
+      #   nvidia.com/gpu.present: "true"
+      #
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: agent
+          image: et-agent:dev
+          # `kind load docker-image et-agent:dev` puts the image in the
+          # cluster's local store; IfNotPresent stops kubelet from
+          # trying to fetch it from a registry that doesn't have it.
+          imagePullPolicy: IfNotPresent
+
+          # No args here: the image's CMD already runs
+          #   gpu-doctor-agent run --mock --scenario idle \
+          #     --attribution-source mock --interval 1.0
+          # For a real GPU rollout, override args explicitly, e.g.:
+          #   args: ["run", "--no-mock", "--attribution-source", "none", "--interval", "1.0"]
+
+          # ---------------------------------------------------------------
+          # LOW-FOOTPRINT BUDGET — this is the agent's overhead contract
+          # on every node it runs on. The Tier-1 sampler is designed to
+          # fit comfortably under this; treat any sustained breach as a
+          # regression to investigate, not as a knob to raise.
+          # ---------------------------------------------------------------
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+          # ---------------------------------------------------------------
+          # Defensive container-level securityContext. The 3c live-tap
+          # variant will need privileged caps (BPF/PERFMON/SYS_RESOURCE),
+          # hostPID, and device access. Those are EXPLICITLY off here so
+          # this manifest can run anywhere without widening blast radius.
+          # ---------------------------------------------------------------
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop: ["ALL"]
+
+          # The agent has no HTTP server today, so we keep the probe
+          # honest: read /proc/1/cmdline and confirm PID 1 is still the
+          # agent. This is essentially a process-existence check — it
+          # catches "container alive but entrypoint replaced/wedged"
+          # cases only incidentally. /proc-based check avoids needing
+          # to install procps for pgrep.
+          #
+          # TODO: when the agent writes a heartbeat file (~/heartbeat,
+          # touched once per sample tick), switch this to:
+          #   exec: ["sh", "-c", "find /home/agent/heartbeat -mmin -1 | grep -q ."]
+          # to detect a wedged-but-alive interpreter as well.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "grep -aq gpu-doctor-agent /proc/1/cmdline"
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "grep -aq gpu-doctor-agent /proc/1/cmdline"
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # readOnlyRootFilesystem means anything the runtime writes
+          # must be backed by an emptyDir. /tmp covers Python's
+          # tempfile + any transitive lib that wants scratch space;
+          # /home/agent covers HOME-rooted caches (some libs touch
+          # ~/.cache even when we don't ask them to). Both are
+          # pod-scoped and tiny — desired, the agent keeps no
+          # on-disk state today.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/agent
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: home
+          emptyDir:
+            sizeLimit: 16Mi
+
+# ---------------------------------------------------------------------------
+# Real GPU cluster checklist — NONE of these are enabled in this file.
+# Treat each as a deliberate change with its own review:
+#
+# 1. Uncomment `nodeSelector { nvidia.com/gpu.present: "true" }` and the
+#    matching toleration block above so the DS only schedules onto
+#    GPU-bearing nodes.
+# 2. Drop --mock from the args. Either run plain Tier-1 against real
+#    NVML (`--no-mock --attribution-source none`) or replay traces
+#    (`--attribution-source file --trace-file /path/to/trace.json`,
+#    mounted via a ConfigMap or PVC).
+# 3. Mount NVML so pynvml can open the device:
+#       volumes:
+#         - name: nvml
+#           hostPath: { path: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 }
+#       volumeMounts:
+#         - { name: nvml, mountPath: /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1, readOnly: true }
+#    (Or rely on the NVIDIA container runtime's automatic injection if
+#    the cluster uses it.) For device access, either request a GPU via
+#    the NVIDIA device plugin (`resources.limits."nvidia.com/gpu": 1`)
+#    or mount /dev/nvidiactl + /dev/nvidia0 via hostPath with a
+#    securityContext that permits it.
+# 4. The 3c eBPF live tap will additionally need: `hostPID: true`,
+#    `capabilities.add: [BPF, PERFMON, SYS_RESOURCE]`, and a
+#    /sys/kernel/debug mount. Each widens blast radius — that profile
+#    belongs in its own manifest, not as a delta on this one.
+# ---------------------------------------------------------------------------

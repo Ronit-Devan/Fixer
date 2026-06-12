@@ -1,0 +1,1 @@
+{"traceEvents": [{"ph": "X", "cat": "kernel", "name": "volta_sgemm", "pid": 1, "tid": 1, "ts": 0, "dur": 150000}, {"ph": "X", "cat": "cpu_op", "name": "torch.save", "pid": 0, "tid": 0, "ts": 150000, "dur": 552500}, {"ph": "X", "cat": "cpu_op", "name": "aten::_dummy_filler", "pid": 0, "tid": 0, "ts": 702500, "dur": 297500}]}

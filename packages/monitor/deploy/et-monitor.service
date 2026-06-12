@@ -1,0 +1,28 @@
+# systemd unit to keep the ET inference monitor running.
+#
+# Install:
+#   1. Edit WorkingDirectory, ExecStart paths, the --gpu-price, and User below.
+#   2. sudo cp deploy/et-monitor.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now et-monitor
+#
+# The ExecStart assumes you've run ./run.sh once (which creates ./.venv).
+
+[Unit]
+Description=ET Inference Monitor (GPU idleness + llama.cpp)
+After=network.target
+
+[Service]
+Type=simple
+# --- EDIT THESE ---
+User=ubuntu
+WorkingDirectory=/opt/ET/packages/monitor
+ExecStart=/opt/ET/packages/monitor/.venv/bin/et-monitor --host 0.0.0.0 --port 7070 --gpu-price 0.50 --llama-url http://localhost:8080 --no-browser
+# ------------------
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

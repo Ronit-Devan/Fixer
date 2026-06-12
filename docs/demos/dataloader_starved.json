@@ -1,0 +1,22 @@
+{
+  "verdict": "dataloader_bound",
+  "confidence": 0.95,
+  "summary": "GPU is 16% utilized. The dominant cause is dataloader stalls: 7416ms (99%) of GPU idle time overlaps with PyTorch DataLoader activity on the CPU.",
+  "evidence": [
+    "GPU utilization: 16%",
+    "Total GPU idle: 7481ms",
+    "Dataloader time during idle: 7416ms"
+  ],
+  "recommended_actions": [
+    "Increase DataLoader num_workers (try 4 or 8).",
+    "Set persistent_workers=True to avoid worker re-spawn.",
+    "Set pin_memory=True for faster H2D transfer.",
+    "Move expensive preprocessing to a separate process or use an iterable dataset.",
+    "Profile your __getitem__ and look for slow image decode or disk reads."
+  ],
+  "metrics": {
+    "gpu_util": 0.16064680370868756,
+    "dataloader_us": 7415532,
+    "idle_us": 7481059
+  }
+}

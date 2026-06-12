@@ -1,0 +1,24 @@
+{
+  "traceEvents": [
+    {
+      "ph": "X",
+      "name": "DataLoader next",
+      "cat": "cpu_op",
+      "pid": 1,
+      "tid": 1,
+      "ts": 0,
+      "dur": 80000,
+      "args": {}
+    },
+    {
+      "ph": "X",
+      "name": "cudaLaunchKernel",
+      "cat": "kernel",
+      "pid": 1,
+      "tid": 2,
+      "ts": 80000,
+      "dur": 10000,
+      "args": {}
+    }
+  ]
+}

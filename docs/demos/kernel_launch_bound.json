@@ -1,0 +1,21 @@
+{
+  "verdict": "kernel_launch_bound",
+  "confidence": 0.8,
+  "summary": "GPU is 11% utilized. Kernels are too small: average 3us, 100% are under 50us. Launch overhead dominates.",
+  "evidence": [
+    "GPU utilization: 11%",
+    "Average kernel duration: 3us",
+    "Tiny kernel ratio: 100%"
+  ],
+  "recommended_actions": [
+    "Increase batch size to make kernels bigger.",
+    "Use torch.compile() to fuse small kernels.",
+    "Use CUDA Graphs for repetitive kernel sequences.",
+    "Check for unnecessary .item() or .cpu() calls causing sync points."
+  ],
+  "metrics": {
+    "gpu_util": 0.11342122349570999,
+    "avg_kernel_us": 2.583597816427574,
+    "tiny_kernel_ratio": 1.0
+  }
+}
