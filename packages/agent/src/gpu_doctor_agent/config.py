@@ -61,6 +61,11 @@ class AgentConfig:
     idle_sustain_s: float = 5.0
     recovery_util_threshold: float = 0.40
     ring_capacity: int = 600
+    # Node identity, so a fleet of DaemonSet pods produces distinguishable
+    # events instead of an indistinguishable stream of "GPU 0 idle". On K8s this
+    # is the node name injected via the downward API (NODE_NAME); see
+    # deploy/daemonset.yaml. Empty when running off-cluster.
+    node_id: str = ""
 
     def __post_init__(self) -> None:
         if self.sample_interval_s <= 0:
@@ -120,6 +125,12 @@ class AgentConfig:
                 e.get("GPU_DOCTOR_RING_CAPACITY"),
                 600,
             ),
+            # Prefer an explicit override, else the K8s downward-API node name.
+            node_id=(
+                e.get("GPU_DOCTOR_NODE_ID")
+                or e.get("NODE_NAME")
+                or ""
+            ),
         )
 
     def with_overrides(
@@ -143,6 +154,7 @@ class AgentConfig:
             ),
             recovery_util_threshold=self.recovery_util_threshold,
             ring_capacity=self.ring_capacity,
+            node_id=self.node_id,  # preserve node identity across CLI overrides
         )
 
 

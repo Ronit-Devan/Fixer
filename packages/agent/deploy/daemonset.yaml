@@ -98,6 +98,16 @@ spec:
           # For a real GPU rollout, override args explicitly, e.g.:
           #   args: ["run", "--no-mock", "--attribution-source", "none", "--interval", "1.0"]
 
+          # Node identity via the downward API: every pod learns the node it runs
+          # on, so a fleet's idle/attribution events are distinguishable
+          # ("ip-10-0-3-12/GPU 0 idle") instead of an anonymous stream. The agent
+          # reads NODE_NAME (see config.AgentConfig.node_id).
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
           # ---------------------------------------------------------------
           # LOW-FOOTPRINT BUDGET — this is the agent's overhead contract
           # on every node it runs on. The Tier-1 sampler is designed to

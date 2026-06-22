@@ -1,0 +1,37 @@
+[project]
+name = "et-remediation"
+version = "0.2.1"
+description = "Guarded GPU remediation/actuation layer for ET: consumes a diagnosed root cause and applies non-disruptive fixes unattended (verify + auto-rollback), with disruptive fixes gated behind human approval."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "devan-p", email = "devanapatel@gmail.com" }]
+license = { text = "MIT" }
+keywords = ["gpu", "remediation", "actuation", "nvidia-smi", "nvml", "llama.cpp", "observability", "self-healing"]
+
+# Zero hard runtime deps on purpose: the layer is decoupled from the engine and
+# monitor via duck-typed Protocols (DiagnosisLike / TelemetrySample), and the
+# real-actuation commands shell out to tools already on the box (nvidia-smi,
+# renice, kubectl, scontrol). NVML writes are an optional accelerator.
+dependencies = []
+
+[project.optional-dependencies]
+# Direct NVML actuation (power/clock) without shelling out to nvidia-smi.
+gpu = ["nvidia-ml-py>=12.535"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+et-remediation = "et_remediation.cli:main"
+
+[project.urls]
+Repository = "https://github.com/devan-p/ET"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/et_remediation"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]

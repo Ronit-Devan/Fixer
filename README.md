@@ -9,6 +9,10 @@ PyTorch Profiler trace in, root-cause verdict out. Eight verdicts calibrated on 
 >   verdicts, and a wasted-GPU-$ readout. One command, opens in your browser.
 >   See [`packages/monitor/README.md`](packages/monitor/README.md).
 >   GTM plan: [`docs/business/GTM.md`](docs/business/GTM.md).
+> - **Remediation** (`packages/remediation`): the actuation layer that *applies*
+>   the fix and resolves the issue — auto-applying non-disruptive fixes and gating
+>   disruptive ones behind human approval, **without ever killing the running
+>   workload.** See [`packages/remediation/README.md`](packages/remediation/README.md).
 
 ---
 
@@ -78,6 +82,33 @@ For `DATALOADER_BOUND`, the engine also detects head-of-line blocking; one slow 
 - **Per-rule decision log.** Every threshold check is evaluated and logged in order. Visible in `--explain`.
 
 ---
+
+## Remediation: apply the fix, not just advise it
+
+`packages/remediation` turns a diagnosed root cause into an **action**, behind a
+hard safety model. It plugs into the live monitor exactly parallel to the alert
+hook (`Monitor.tick()` → diagnosis → `RemediationManager.observe()`), so
+detection/diagnosis are untouched.
+
+- **Two classes.** Every fix is **NON-DISRUPTIVE** (power/clock limits, MPS/MIG,
+  freeing stale cache, killing *only* orphaned PIDs, re-nicing loader workers) or
+  **DISRUPTIVE** (needs a job / `llama-server` restart).
+- **Non-disruptive auto-applies unattended** — but never blind: through
+  `classify → guard → apply → verify recovery in a bounded window → confirm or
+  AUTO-ROLLBACK`.
+- **Disruptive never auto-fires** — it only ever opens a human-gated approval
+  request, after checkpoint + request-drain.
+- **The running workload is never killed by a non-disruptive path** — enforced
+  structurally (a non-disruptive action can't carry a restart kind; every
+  process-touching call refuses a protected PID).
+- **Circuit breaker** trips auto-apply to advise-only on repeated failure, flap,
+  or rate-cap breach. A **global kill-switch** (`off`/`advise`/`dry_run`/`auto`)
+  forces advise-only for ops, set via a first-run setup wizard, the CLI
+  (`et-remediation mode advise`), or the dashboard. Every action is **audited**.
+- **Two backends, one interface:** a DataCenter actuator (nvidia-smi/NVML/DCGM,
+  K8s/Slurm) and a llama.cpp actuator (drain + restart with tuned flags).
+
+Full details and the safety model: [`packages/remediation/README.md`](packages/remediation/README.md).
 
 ## See the engine's reasoning
 
@@ -150,7 +181,9 @@ We read systems papers and ship the insights as detectors.
 
 ## Status
 
-v0.3 engine. Eight verdicts calibrated on real Colab traces. 137 tests, CI green. Kubernetes agent and web UI in progress.
+v0.3 engine. Eight verdicts calibrated on real Colab traces. Kubernetes agent and web UI in progress. Guarded auto-remediation layer (`packages/remediation`).
+
+Hardened for **accuracy, efficiency, and scale**: predictive early-warning (throttle / KV-saturation / OOM caught *before* they land), adaptive sampling (~78% fewer GPU reads on a stable box — minimal overhead next to your workload), and true multi-GPU / fleet support (per-GPU diagnosis + remediation, fleet-aggregate idle cost, per-(node,gpu) blast-radius). 432 tests across engine (140), agent (111), monitor (77), remediation (95), and web/api (9); CI green.
 
 ---
 

@@ -78,10 +78,11 @@ def _render_samples_table(samples: list[Sample]) -> Table:
     return t
 
 
-def _format_idle_alert(event: IdleEvent, sustain_s: float) -> str:
+def _format_idle_alert(event: IdleEvent, sustain_s: float, node_id: str = "") -> str:
     pct = event.mean_util * 100
+    where = f"{node_id}/" if node_id else ""
     return (
-        f"[bold red]ALERT[/] GPU {event.gpu_index} idle for {sustain_s:g}s "
+        f"[bold red]ALERT[/] {where}GPU {event.gpu_index} idle for {sustain_s:g}s "
         f"at {pct:.1f}% — attribution pending (Tier 2)"
     )
 
@@ -197,7 +198,9 @@ def run_loop(
                 elif event_source is None:
                     # No-attribution path — preserves byte-identical behavior
                     # with pre-Tier-2 builds when --attribution-source=none.
-                    console.print(_format_idle_alert(event, config.idle_sustain_s))
+                    console.print(
+                        _format_idle_alert(event, config.idle_sustain_s, config.node_id)
+                    )
                 else:
                     # Tier-2 attribution path. Anything here must be defensive:
                     # an attribution failure falls back to the plain alert and

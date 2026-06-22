@@ -16,7 +16,14 @@ dependencies = [
 # Real NVIDIA telemetry without shelling out to nvidia-smi. Optional: the app
 # falls back to nvidia-smi, then to mock data, if this isn't installed.
 gpu = ["nvidia-ml-py>=12.535"]
-dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6"]
+# The guarded auto-remediation layer. Optional: without it the monitor runs
+# exactly as before (advise-only). With it, --remediation-mode auto/advise/... is
+# available and the dashboard exposes the remediation panel + kill-switch.
+remediation = ["et-remediation"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6", "et-remediation"]
+
+[tool.uv.sources]
+et-remediation = { path = "../remediation" }
 
 [project.scripts]
 et-monitor = "et_monitor.__main__:main"

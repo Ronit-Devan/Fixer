@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import mean
 
+from et_monitor.trends import r_squared, time_to_threshold
 from et_monitor.types import VERDICT_TITLES, Diagnosis, Snapshot, Verdict
 
 
@@ -41,6 +42,12 @@ class Thresholds:
     throttle_clock_ratio: float = 0.70  # below this under load = throttling
     throttle_util_pct: float = 60.0  # "under load" floor for throttle check
     min_samples: int = 3  # need this many ticks to call anything
+    # --- predictive (early-warning) detection ---
+    predict_horizon_s: float = 60.0  # only warn on a crossing within this horizon
+    throttle_temp_c: float = 84.0  # temperature that tends to trigger HW throttle
+    vram_pressure_ratio: float = 0.95  # VRAM fraction treated as OOM-imminent
+    min_trend_samples: int = 4  # need this many readings to trust a trend
+    min_trend_r2: float = 0.6  # reject noisy fits: the trend must explain >= this
 
 
 def _vals(window: list[Snapshot], attr: str) -> list[float]:
@@ -65,6 +72,9 @@ def _make(
     evidence: list[str],
     recommendations: list[str],
     metrics: dict,
+    *,
+    predicted: bool = False,
+    horizon_s: float | None = None,
 ) -> Diagnosis:
     return Diagnosis(
         verdict=verdict,
@@ -75,7 +85,114 @@ def _make(
         evidence=evidence,
         recommendations=recommendations,
         metrics=metrics,
+        predicted=predicted,
+        horizon_s=round(horizon_s, 1) if horizon_s is not None else None,
     )
+
+
+def _series(window: list[Snapshot], attr: str) -> tuple[list[float], list[float]]:
+    """(timestamps, values) for samples where ``attr`` and the timestamp exist."""
+    times: list[float] = []
+    vals: list[float] = []
+    for s in window:
+        v = getattr(s, attr, None)
+        if v is not None and s.timestamp_s is not None:
+            times.append(float(s.timestamp_s))
+            vals.append(float(v))
+    return times, vals
+
+
+def _predict(
+    window: list[Snapshot], t: Thresholds, mean_util: float, llama_on: bool, metrics: dict
+) -> Diagnosis | None:
+    """Early-warning verdicts from trends, before the problem actually lands.
+
+    Ordered by danger: an imminent OOM (which would kill the workload) outranks
+    an imminent throttle, which outranks imminent KV saturation. Each fires only
+    when the projected crossing is within ``predict_horizon_s``. Confidence rises
+    as the crossing gets nearer. Returns None if nothing is imminent.
+    """
+    if len(window) < t.min_trend_samples:
+        return None
+
+    def _conf(horizon: float) -> float:
+        return 0.5 + 0.45 * (1.0 - min(horizon, t.predict_horizon_s) / t.predict_horizon_s)
+
+    def _project(times: list[float], vals: list[float], target: float, rising: bool) -> float | None:
+        """Horizon to cross ``target`` — only if there are enough points, the fit
+        is good enough (not noise), and the crossing is within the horizon."""
+        if len(times) < t.min_trend_samples:
+            return None
+        r2 = r_squared(times, vals)
+        if r2 is None or r2 < t.min_trend_r2:
+            return None
+        tt = time_to_threshold(times, vals, target, rising=rising)
+        return tt if (tt is not None and tt <= t.predict_horizon_s) else None
+
+    # 1) VRAM climbing toward OOM — the workload-killing failure.
+    mt, mv = _series(window, "mem_used_ratio")
+    tt_oom = _project(mt, mv, t.vram_pressure_ratio, True)
+    if tt_oom is not None:
+        return _make(
+            Verdict.VRAM_PRESSURE, "warn", _conf(tt_oom),
+            f"VRAM is climbing and is on track to hit {t.vram_pressure_ratio:.0%} "
+            f"(OOM risk) in ~{tt_oom:.0f}s. Acting now avoids an out-of-memory crash.",
+            [f"VRAM now: {mv[-1]:.0%}", f"Projected OOM in: ~{tt_oom:.0f}s"],
+            [
+                "Free unused/leaked allocations or stop a stale process holding VRAM.",
+                "If this is real demand, lower --ctx-size/--parallel or move to a bigger card before it OOMs.",
+            ],
+            {**metrics, "predicted_oom_s": round(tt_oom, 1)},
+            predicted=True, horizon_s=tt_oom,
+        )
+
+    # 2) Thermal throttle imminent (under load): temp rising to the throttle
+    #    point, or SM clock already sliding toward the throttle floor.
+    if mean_util >= t.throttle_util_pct:
+        ttemp, vtemp = _series(window, "temp_c")
+        tt_temp = _project(ttemp, vtemp, t.throttle_temp_c, True)
+        tclk, vclk = _series(window, "clock_ratio")
+        tt_clk = _project(tclk, vclk, t.throttle_clock_ratio, False)
+        horizons = [h for h in (tt_temp, tt_clk) if h is not None]
+        if horizons:
+            horizon = min(horizons)
+            why = "temperature" if tt_temp is not None and tt_temp == horizon else "SM clock"
+            return _make(
+                Verdict.THERMAL_THROTTLE, "warn", _conf(horizon),
+                f"On track to throttle in ~{horizon:.0f}s ({why} trend) while under "
+                "load. Raising the power limit / improving cooling now keeps tokens/sec.",
+                [
+                    f"Mean utilization: {mean_util:.0f}%",
+                    *([f"Temp now: {vtemp[-1]:.0f}°C, throttle ~{t.throttle_temp_c:.0f}°C"] if vtemp else []),
+                    f"Projected throttle in: ~{horizon:.0f}s",
+                ],
+                [
+                    "Raise the power limit (nvidia-smi -pl) if the card/PSU allow.",
+                    "Improve airflow / cooling, or pre-emptively lower sustained load (--parallel).",
+                ],
+                {**metrics, "predicted_throttle_s": round(horizon, 1)},
+                predicted=True, horizon_s=horizon,
+            )
+
+    # 3) KV cache filling toward saturation (callers will start queueing).
+    if llama_on:
+        tk, vk = _series(window, "kv_cache_usage_ratio")
+        tt_kv = _project(tk, vk, t.kv_pressure_ratio, True)
+        if tt_kv is not None:
+            return _make(
+                Verdict.KV_CACHE_PRESSURE, "warn", _conf(tt_kv),
+                f"KV cache is filling and is on track to hit {t.kv_pressure_ratio:.0%} "
+                f"in ~{tt_kv:.0f}s; requests will start queueing. Scale out or tune now.",
+                [f"KV now: {vk[-1]:.0%}", f"Projected saturation in: ~{tt_kv:.0f}s"],
+                [
+                    "Enlarge the cache (--ctx-size) or quantize it (--cache-type-k/v q8_0).",
+                    "If sustained, scale out a second server before callers are deferred.",
+                ],
+                {**metrics, "predicted_kv_full_s": round(tt_kv, 1)},
+                predicted=True, horizon_s=tt_kv,
+            )
+
+    return None
 
 
 def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Diagnosis:
@@ -182,6 +299,15 @@ def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Dia
             ],
             metrics,
         )
+
+    # --- Predictive early-warning: catch a problem that is still FORMING -----
+    # Runs after the reactive crit/warn rules (an actual throttle/pressure still
+    # wins) but before the benign verdicts, so a box that currently looks healthy
+    # or merely decoding is flagged when a trend projects danger soon. Remediation
+    # can then act with lead time instead of after tokens/sec are already lost.
+    predicted = _predict(window, t, mean_util, llama_on, metrics)
+    if predicted is not None:
+        return predicted
 
     # --- Rule 3: IDLE_NO_REQUESTS; the GPU is sitting idle. -----------------
     if active_frac < 0.10 and mean_util < t.idle_util_pct:

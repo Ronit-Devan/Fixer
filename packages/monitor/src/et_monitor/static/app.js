@@ -141,6 +141,25 @@ function render(state) {
     $("t-kv").textContent = snap.kv_cache_usage_ratio != null ? fmt(snap.kv_cache_usage_ratio * 100, 0, "%") : "-";
   }
 
+  // per-GPU strip (only when the box has more than one card)
+  const gpus = (snapshot.gpus || []);
+  const strip = $("gpu-strip");
+  if (gpus.length > 1) {
+    strip.hidden = false;
+    const host = snapshot.host_label ? snapshot.host_label + " · " : "";
+    $("gpu-cards").innerHTML = gpus.map((g) => {
+      const u = g.latest && g.latest.util_pct != null ? Math.round(g.latest.util_pct) + "%" : "-";
+      const d = g.diagnosis || {};
+      const sev = d.severity || "info";
+      const v = (d.verdict || "").replace(/_/g, " ");
+      const pred = d.predicted ? " ⚠︎" : "";
+      return `<div class="gpu-chip ${sev}"><b>${host}GPU ${g.index}</b>` +
+             `<span>${u}</span><em>${v}${pred}</em></div>`;
+    }).join("");
+  } else {
+    strip.hidden = true;
+  }
+
   // charts
   const tail = history.slice(-180);
   drawChart($("chart-util"), tail.map((x) => x.util_pct), { max: 100, color: COLORS.info });
@@ -160,6 +179,74 @@ async function poll() {
   }
 }
 
+// ---- remediation panel (only renders when the layer is enabled) ----------
+let remModeDirty = false;
+async function pollRemediation() {
+  let state;
+  try {
+    state = await (await fetch("/api/remediation/state", { cache: "no-store" })).json();
+  } catch { return; }
+  const panel = $("remediation-panel");
+  if (!state || !state.enabled) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const sel = $("rem-mode-select");
+  if (!remModeDirty && document.activeElement !== sel) sel.value = state.mode;
+  $("rem-state").textContent = "state: " + state.state;
+  $("rem-breaker").textContent = "breaker: " + state.breaker_state;
+  $("rem-breaker").classList.toggle("warn-pill", state.breaker_state !== "closed");
+
+  // pending approvals
+  const ap = state.pending_approvals || [];
+  $("rem-approvals").hidden = ap.length === 0;
+  const al = $("rem-approval-list");
+  al.innerHTML = "";
+  ap.forEach((a) => {
+    const li = document.createElement("li");
+    li.innerHTML =
+      `<div><strong>${a.root_cause.replace(/_/g, " ")}</strong> — ${a.summary}` +
+      `<code>${a.command_preview || ""}</code></div>`;
+    const ok = document.createElement("button");
+    ok.textContent = "Approve"; ok.className = "rem-approve";
+    ok.onclick = () => act(`/api/remediation/approvals/${a.id}/approve`);
+    const no = document.createElement("button");
+    no.textContent = "Reject"; no.className = "rem-reject";
+    no.onclick = () => act(`/api/remediation/approvals/${a.id}/reject`);
+    li.appendChild(ok); li.appendChild(no);
+    al.appendChild(li);
+  });
+
+  // audit tail
+  try {
+    const audit = await (await fetch("/api/remediation/audit", { cache: "no-store" })).json();
+    const list = $("rem-audit-list");
+    list.innerHTML = "";
+    (audit.records || []).slice(-8).reverse().forEach((r) => {
+      const li = document.createElement("li");
+      li.textContent = `${r.phase} · ${r.root_cause} · ${r.action_kind || ""} · ${r.decision}`;
+      list.appendChild(li);
+    });
+  } catch { /* ignore */ }
+}
+
+async function act(url) {
+  try { await fetch(url, { method: "POST" }); } catch { /* ignore */ }
+  pollRemediation();
+}
+
+$("rem-mode-select").addEventListener("change", async (e) => {
+  remModeDirty = true;
+  await fetch("/api/remediation/mode", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: e.target.value }),
+  }).catch(() => {});
+  remModeDirty = false;
+  pollRemediation();
+});
+
 poll();
+pollRemediation();
 setInterval(poll, POLL_MS);
+setInterval(pollRemediation, 2000);
 window.addEventListener("resize", () => { if (started) poll(); });

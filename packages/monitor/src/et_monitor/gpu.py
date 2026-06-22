@@ -176,11 +176,16 @@ class NvidiaSmiGpuSampler(GpuSampler):
         if not self._smi:
             raise RuntimeError("nvidia-smi not found on PATH")
         self._indices = set(indices) if indices is not None else None
-        if not self.read():
+        # One validating read at construction; cache the GPU count from it so
+        # gpu_count() never spawns another subprocess (the physical GPU count
+        # does not change at runtime). Avoids 2 extra nvidia-smi forks at startup.
+        first = self.read()
+        if not first:
             raise RuntimeError("nvidia-smi returned no GPUs")
+        self._count = len(first)
 
     def gpu_count(self) -> int:
-        return len(self.read())
+        return self._count
 
     def read(self) -> list[GpuReading]:
         now = time.time()

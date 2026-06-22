@@ -90,10 +90,45 @@ Get pinged when the GPU needs attention; no need to watch the dashboard.
 | **Memory under-used** | Lots of VRAM free while in use | Bigger/higher-precision model, larger context, more parallel slots |
 | **KV cache pressure** | Cache near full / requests deferred | Tune `--ctx-size`/`--parallel`; prefix caching; this is your scale-out signal |
 | **Throttling** | SM clock dragged down under load | Cooling/airflow; check power limit |
+| **VRAM pressure** | VRAM climbing toward OOM (predicted) | Free/again-cache before it crashes; lower ctx/parallel |
 | **Healthy** | Well used, nothing to do |  |
 
 It also shows live charts (utilization, VRAM, tokens/sec, KV cache) and a
 session **idle-fraction + projected monthly idle cost**.
+
+### Catches problems *before* they land (predictive)
+
+Beyond the reactive verdicts above, the monitor fits a trend to the recent window
+and projects when a metric will cross a danger line — so it warns with lead time:
+
+- **Throttle imminent** — temperature climbing toward the throttle point (or SM
+  clock sliding) *before* tokens/sec are lost.
+- **KV saturation imminent** — cache fill-rate projects it will hit the ceiling
+  and start deferring requests soon.
+- **OOM imminent** — VRAM growth trend projects an out-of-memory crash, the one
+  failure that kills the workload.
+
+Predicted verdicts carry `predicted: true` and a `horizon_s` (estimated seconds
+until the event), which lets the remediation layer act pre-emptively.
+
+### Multi-GPU & fleets
+
+The monitor tracks **every GPU on the box** (a DGX with 8 cards, not just card 0):
+per-GPU history, diagnosis, and remediation, with a **fleet-aggregate** idle-cost
+readout (so an 8-GPU box reports 8 cards' idle dollars, not one). `GET /api/state`
+carries a `gpus[]` array; the report breaks down per card. Each GPU remediates
+independently (its own circuit breaker + approvals), and a shared blast-radius cap
+limits how many cards auto-remediate at once. Pass `--host-label` (or it uses the
+hostname) so a fleet's events are distinguishable.
+
+### Very low overhead (non-negotiable)
+
+This runs next to your production workload, so it must not perturb it. The loop
+**adaptively backs off** when the box is provably quiescent (healthy or plainly
+idle) — up to ~78% fewer GPU reads over a stable window — and snaps back to the
+fast rate the instant anything changes or a trend looks risky. It prefers NVML
+(no subprocess) over `nvidia-smi`, caches the GPU count, walks only the trailing
+window per tick, and self-reports its own per-tick cost at `snapshot().perf`.
 
 ### Shareable report
 
@@ -115,6 +150,39 @@ GPU backend order: `pynvml` → `nvidia-smi` → mock. Whichever works first win
 the chosen backend is logged at startup and shown in the dashboard footer.
 
 ---
+
+## Auto-remediation (optional)
+
+With `packages/remediation` installed, the monitor can *apply* the fix, not just
+advise it. It's **off by default**; enable it per the operating mode:
+
+```bash
+et-monitor --remediation-setup                 # first-run wizard: pick the mode
+et-monitor --remediation-mode advise           # recommend only (never touches the box)
+et-monitor --remediation-mode auto             # auto-apply NON-DISRUPTIVE fixes
+et-monitor --remediation-mode auto --remediation-audit-log ~/.et/remediation.jsonl
+```
+
+- **NON-DISRUPTIVE fixes** (power/clock limits, MPS/MIG, freeing stale cache,
+  killing only orphaned PIDs) auto-apply through a guarded path: apply → watch a
+  bounded window for recovery → confirm or **auto-rollback**. The running
+  `llama-server` / training job is **never** killed by this path.
+- **DISRUPTIVE fixes** (restart `llama-server` with tuned `-ngl`/`-t`/`-b`/cache
+  flags) **never** auto-fire — they appear as an approval card in the dashboard,
+  applied only after you approve (and a request-drain).
+- A **circuit breaker** trips auto-apply to advise-only on repeated failure /
+  flap / rate-cap breach.
+
+**Disable auto-apply for ops (the kill-switch):**
+
+```bash
+et-remediation mode advise        # or: off
+curl -XPOST localhost:7070/api/remediation/mode -d '{"mode":"advise"}'
+```
+
+The dashboard shows a remediation panel (mode selector, breaker state, pending
+approvals, recent actions). Full safety model:
+[`../remediation/README.md`](../remediation/README.md).
 
 ## How it fits ET
 

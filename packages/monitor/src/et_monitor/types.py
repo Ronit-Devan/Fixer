@@ -13,6 +13,7 @@ class Verdict(str, Enum):
     DECODE_BANDWIDTH_BOUND = "decode_bandwidth_bound"
     KV_CACHE_PRESSURE = "kv_cache_pressure"
     THERMAL_THROTTLE = "thermal_throttle"
+    VRAM_PRESSURE = "vram_pressure"  # VRAM climbing toward OOM (predictive)
     UNKNOWN = "unknown"
 
 
@@ -24,6 +25,7 @@ VERDICT_TITLES: dict[Verdict, str] = {
     Verdict.DECODE_BANDWIDTH_BOUND: "Decode is memory-bandwidth bound",
     Verdict.KV_CACHE_PRESSURE: "KV cache under pressure",
     Verdict.THERMAL_THROTTLE: "GPU is throttling",
+    Verdict.VRAM_PRESSURE: "VRAM filling toward out-of-memory",
     Verdict.UNKNOWN: "Not enough signal yet",
 }
 
@@ -75,6 +77,12 @@ class Diagnosis:
     evidence: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    # Predictive flag: this verdict was raised from a TREND projection before the
+    # problem actually landed (e.g. temperature climbing toward the throttle
+    # point), not from the current state already being bad. ``horizon_s`` is the
+    # estimated time until the threshold is crossed, so remediation can act early.
+    predicted: bool = False
+    horizon_s: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,4 +94,6 @@ class Diagnosis:
             "evidence": self.evidence,
             "recommendations": self.recommendations,
             "metrics": self.metrics,
+            "predicted": self.predicted,
+            "horizon_s": self.horizon_s,
         }

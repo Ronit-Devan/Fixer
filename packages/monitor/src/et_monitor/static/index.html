@@ -60,6 +60,12 @@
       <div class="tile"><div class="tile-label">KV cache</div><div class="tile-val" id="t-kv">-</div></div>
     </section>
 
+    <!-- Per-GPU strip (multi-GPU boxes only) -->
+    <section class="gpu-strip" id="gpu-strip" hidden>
+      <div class="recs-label">GPUs on this box</div>
+      <div class="gpu-cards" id="gpu-cards"></div>
+    </section>
+
     <!-- Charts -->
     <section class="charts">
       <div class="card chart-card">
@@ -78,6 +84,32 @@
         <div class="chart-title">KV cache usage <span>%</span></div>
         <canvas id="chart-kv" height="150"></canvas>
       </div>
+    </section>
+
+    <!-- Remediation (only shown when the layer is enabled) -->
+    <section class="card remediation" id="remediation-panel" hidden>
+      <div class="rem-head">
+        <strong>Auto-remediation</strong>
+        <label class="rem-mode">
+          mode
+          <select id="rem-mode-select" title="Operating mode (the kill-switch)">
+            <option value="off">off</option>
+            <option value="advise">advise</option>
+            <option value="dry_run">dry-run</option>
+            <option value="auto">auto</option>
+          </select>
+        </label>
+        <span class="pill" id="rem-state">state: -</span>
+        <span class="pill" id="rem-breaker">breaker: -</span>
+      </div>
+      <div class="rem-approvals" id="rem-approvals" hidden>
+        <div class="recs-label">Awaiting your approval (disruptive — needs checkpoint + drain)</div>
+        <ul id="rem-approval-list" class="rem-list"></ul>
+      </div>
+      <details class="rem-audit">
+        <summary>Recent actions</summary>
+        <ul id="rem-audit-list" class="rem-list"></ul>
+      </details>
     </section>
 
     <footer class="footer">

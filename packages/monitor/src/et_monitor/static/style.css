@@ -135,3 +135,30 @@ canvas { width: 100%; height: 150px; display: block; }
 }
 .report-link { color: var(--link); text-decoration: none; font-weight: 600; }
 .report-link:hover { text-decoration: underline; }
+
+/* ---- remediation panel ---- */
+.remediation { margin-top: 22px; padding: 18px 20px; }
+.rem-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.rem-mode { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.rem-mode select { font: inherit; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.warn-pill { color: var(--crit, #b91c1c); border-color: currentColor; }
+.rem-approvals { margin-top: 14px; }
+.rem-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.rem-list li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.rem-list code { display: block; margin-top: 3px; font-size: 11px; color: var(--faint); word-break: break-all; }
+.rem-approve, .rem-reject { font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--line); cursor: pointer; }
+.rem-approve { background: #15803d; color: #fff; border-color: #15803d; }
+.rem-reject { background: #fff; color: #b91c1c; }
+.rem-audit { margin-top: 14px; font-size: 12px; color: var(--faint); }
+.rem-audit summary { cursor: pointer; color: var(--muted); }
+
+/* ---- per-GPU strip (multi-GPU) ---- */
+.gpu-strip { margin-top: 22px; }
+.gpu-cards { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+.gpu-chip { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 110px; background: #fff; }
+.gpu-chip b { font-size: 12px; color: var(--muted); }
+.gpu-chip span { font-size: 20px; font-weight: 700; }
+.gpu-chip em { font-size: 11px; font-style: normal; color: var(--faint); }
+.gpu-chip.warn { border-color: #b45309; }
+.gpu-chip.crit { border-color: #b91c1c; }
+.gpu-chip.ok { border-color: #15803d; }
