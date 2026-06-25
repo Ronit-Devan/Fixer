@@ -8,26 +8,86 @@ No cloud, no account, no build step. One command, opens in your browser.
 
 ---
 
-## Run it (30 seconds)
+## Requirements
 
-**macOS / Linux**
+A single-GPU `llama.cpp` box needs exactly four things; check each before you start:
+
+| Need | Why | Verify |
+|---|---|---|
+| **NVIDIA GPU + driver** | live utilization / VRAM / power / clock readings (via NVML) | `nvidia-smi` prints your card |
+| **Python 3.10+** | runs the monitor | `python --version` (Windows) / `python3 --version` |
+| **`llama.cpp` `llama-server`** | the inference server being watched | `llama-server --version` |
+| **Git** | to fetch the repo (or download the ZIP) | `git --version` |
+
+No CUDA toolkit, compiler, or build step is needed for the monitor itself — it
+*reads* the driver, it doesn't compile kernels. A single GPU is the common case
+here, and it's exactly where the **decode roofline** earns its keep: one stream
+can't push utilization to 90%, so "40% utilized" is meaningless without it.
+
+## Install & run (single GPU + llama.cpp)
+
+The `run.sh` / `run.bat` script *is* the installer: it creates a private
+virtualenv, installs the app with NVIDIA telemetry, and opens the dashboard.
+No `uv`, no Docker, no global Python pollution. Four steps, ~30 seconds.
+
+**1. Get the code**
 
 ```bash
-cd packages/monitor
+git clone https://github.com/Ronit-Devan/Fixer
+cd Fixer/packages/monitor
+```
+
+**2. Start `llama-server` with metrics** — in its own terminal, left running
+
+The monitor reads llama.cpp's Prometheus metrics, which the server only exposes
+when you pass `--metrics`:
+
+```bash
+llama-server -m model.gguf -ngl 999 --port 8080 --metrics
+```
+
+`-ngl 999` offloads **all** layers onto your single GPU; the monitor flags it if
+any are stuck on the CPU (the #1 single-GPU throughput bug). Default port `8080`
+is what the monitor looks for.
+
+**3. Launch the monitor**
+
+macOS / Linux:
+
+```bash
 ./run.sh --gpu-price 0.50
 ```
 
-**Windows**
+Windows:
 
 ```bat
-cd packages\monitor
 run.bat --gpu-price 0.50
 ```
 
-That creates a virtual environment, installs the app, and opens
-`http://localhost:7070` in your browser. `--gpu-price` is your GPU cost in
-$/hour. It turns on the "wasted on idle" readout (leave it off if you don't
-care about the dollar figure).
+First run creates `.venv/`, installs `et-gpu-monitor` with the `[gpu]` extra
+(`nvidia-ml-py`; it falls back to `nvidia-smi`, then mock data, if that wheel
+won't build), and opens `http://localhost:7070` in your browser. `--gpu-price`
+is your GPU cost in $/hour — it turns on the "wasted on idle" dollar readout;
+omit it if you don't care. If your `llama-server` is elsewhere, add
+`--llama-url http://localhost:8081`.
+
+**4. Turn on the decode roofline** (recommended, one-time)
+
+```bash
+./run.sh --detect          # Windows: run.bat --detect
+```
+
+This probes `llama-server` `/props` + the model GGUF + the GPU, prints your
+single-stream tok/s ceiling, and saves `~/.et/workload.json` so MBU / "% of
+ceiling" / partial-offload diagnosis runs every tick. It also **auto-runs on
+first launch** whenever `llama-server` is reachable, so on a fresh box the
+roofline is usually already on — run it explicitly to see the ceiling number, or
+when you need the flags below:
+
+- model path not exposed by `/props`? add `--model /path/to/model.gguf`
+- card not in the bandwidth table? add `--gpu-bandwidth <GB/s>`
+
+That's the whole install. The dashboard updates live; **Ctrl-C** to stop.
 
 **No GPU handy? See it work anyway:**
 
@@ -37,7 +97,7 @@ care about the dollar figure).
 
 The demo plays a scripted inference timeline so the dashboard cycles through
 every verdict (idle → decode-bound → memory headroom → KV pressure →
-throttling → healthy).
+throttling → healthy) — no GPU or model required.
 
 ---
 
