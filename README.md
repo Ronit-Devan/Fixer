@@ -5,8 +5,10 @@ PyTorch Profiler trace in, root-cause verdict out. Eight verdicts calibrated on 
 > **Two products, same idea: attribute GPU idleness to a root cause.**
 > - **Training** (`packages/engine`): diagnose a PyTorch Profiler trace. ← this README.
 > - **Inference** (`packages/monitor`): a local web app you run on a `llama.cpp`
->   serving box: live GPU + `llama-server` monitoring, idle/decode/KV/throttle
->   verdicts, and a wasted-GPU-$ readout. One command, opens in your browser.
+>   serving box: live GPU + `llama-server` monitoring; a decode **roofline**
+>   (MBU / single-stream tok/s ceiling / partial-offload) that answers "you're at
+>   X% of *what*?"; idle/decode/KV/throttle verdicts; and a wasted-GPU-$ readout.
+>   One command, opens in your browser.
 >   See [`packages/monitor/README.md`](packages/monitor/README.md).
 >   GTM plan: [`docs/business/GTM.md`](docs/business/GTM.md).
 > - **Remediation** (`packages/remediation`): the actuation layer that *applies*
@@ -47,8 +49,8 @@ Recommended actions:
 ## Install
 
 ```bash
-git clone https://github.com/devan-p/ET
-cd ET/packages/engine
+git clone https://github.com/Ronit-Devan/Fixer
+cd Fixer/packages/engine
 uv sync
 uv run gpu-doctor ../../fixtures/dataloader_starved.json
 ```
@@ -183,7 +185,7 @@ We read systems papers and ship the insights as detectors.
 
 v0.3 engine. Eight verdicts calibrated on real Colab traces. Kubernetes agent and web UI in progress. Guarded auto-remediation layer (`packages/remediation`).
 
-Hardened for **accuracy, efficiency, and scale**: predictive early-warning (throttle / KV-saturation / OOM caught *before* they land), adaptive sampling (~78% fewer GPU reads on a stable box — minimal overhead next to your workload), and true multi-GPU / fleet support (per-GPU diagnosis + remediation, fleet-aggregate idle cost, per-(node,gpu) blast-radius). 432 tests across engine (140), agent (111), monitor (77), remediation (95), and web/api (9); CI green.
+Hardened for **accuracy, efficiency, and scale**: predictive early-warning (throttle / KV-saturation / OOM caught *before* they land), adaptive sampling (~78% fewer GPU reads on a stable box — minimal overhead next to your workload), a **decode roofline** for llama.cpp (MBU / single-stream tok/s ceiling / partial-offload detection, so "40% utilized" becomes "40% of the card's bandwidth ceiling — fixable" vs "at the single-stream wall — physics"), and true multi-GPU / fleet support (per-GPU diagnosis + remediation, fleet-aggregate idle cost, per-(node,gpu) blast-radius). Built to run untouched for months: NTP-clock-step safe, NVML driver-loss recovery, and rotated/bounded audit + approval state. 485 tests across engine (140), agent (111), monitor (112), remediation (113), and web/api (9); CI green.
 
 ---
 

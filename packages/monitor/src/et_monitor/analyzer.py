@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from statistics import mean
 
+from et_monitor.perf import WorkloadSpec, roofline
 from et_monitor.trends import r_squared, time_to_threshold
 from et_monitor.types import VERDICT_TITLES, Diagnosis, Snapshot, Verdict
 
@@ -39,6 +40,11 @@ class Thresholds:
     busy_util_pct: float = 80.0  # at/above this under load = saturated/healthy
     mem_headroom_ratio: float = 0.55  # below this = meaningful VRAM free
     kv_pressure_ratio: float = 0.90  # at/above this = cache nearly full
+    # Deferral (requests queued) is only KV pressure when the cache is genuinely
+    # contended. Deferral with a NOT-full cache is slot under-provisioning, which
+    # is under-batching (raise --parallel/--cont-batching) — a different fix — so
+    # it falls through to the decode rule rather than recommending "lower --parallel".
+    kv_defer_pressure_ratio: float = 0.75
     throttle_clock_ratio: float = 0.70  # below this under load = throttling
     throttle_util_pct: float = 60.0  # "under load" floor for throttle check
     min_samples: int = 3  # need this many ticks to call anything
@@ -195,8 +201,22 @@ def _predict(
     return None
 
 
-def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Diagnosis:
-    """Return the dominant diagnosis for a recent window of snapshots."""
+def analyze(
+    window: list[Snapshot],
+    thresholds: Thresholds | None = None,
+    spec: WorkloadSpec | None = None,
+) -> Diagnosis:
+    """Return the dominant diagnosis for a recent window of snapshots.
+
+    When a ``WorkloadSpec`` is supplied (model size + layer count + GPU memory
+    bandwidth, captured at setup) the analyzer additionally computes the decode
+    roofline — memory-bandwidth utilization (MBU), the single-stream tok/s
+    ceiling, and partial-offload status — which it uses to (a) tell a genuinely
+    misconfigured box (partial offload / host-bound) apart from one that is
+    simply at the physical single-stream wall, and (b) attach those numbers to
+    every diagnosis's ``metrics`` so remediation and the UI can act on them.
+    Without a spec it behaves exactly as before (pure util-based heuristics).
+    """
     t = thresholds or Thresholds()
 
     if len(window) < t.min_samples:
@@ -217,6 +237,8 @@ def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Dia
     max_kv = max(_vals(window, "kv_cache_usage_ratio"), default=0.0)
     max_deferred = max(_vals(window, "requests_deferred"), default=0.0)
     gen_tps = _mean_or(window, "gen_tokens_per_s", 0.0) or 0.0
+    mean_conc = _mean_or(window, "requests_processing", 0.0) or 0.0
+    mean_total_mb = _mean_or(window, "mem_total_mb")
 
     # "Active" = actually serving a request. With llama metrics we know exactly
     # (requests_processing >= 1); without them we proxy from GPU utilization.
@@ -238,8 +260,16 @@ def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Dia
         "max_requests_deferred": max_deferred,
         "active_fraction": round(active_frac, 3),
         "gen_tokens_per_s": round(gen_tps, 1),
+        "mean_concurrency": round(mean_conc, 2),
         "llama_connected": llama_on,
     }
+
+    # Decode roofline (only when a spec gives us the model+bandwidth facts). The
+    # numbers ride into every diagnosis's metrics so the UI and remediation can
+    # read MBU / single-stream ceiling / partial-offload without recomputing.
+    rl = roofline(spec, gen_tps if gen_tps > 0 else None, concurrency=mean_conc)
+    if rl is not None:
+        metrics.update(rl.to_metrics())
 
     # --- Rule 1: THERMAL_THROTTLE; clock dragged down while under load. -----
     if (
@@ -272,8 +302,14 @@ def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Dia
             metrics,
         )
 
-    # --- Rule 2: KV_CACHE_PRESSURE; cache full and/or requests deferred. ----
-    if llama_on and (max_kv >= t.kv_pressure_ratio or max_deferred >= 1):
+    # --- Rule 2: KV_CACHE_PRESSURE; cache full (optionally with deferral). ---
+    # Deferral only counts as cache pressure when the cache is actually contended
+    # (>= kv_defer_pressure_ratio); deferral with a near-empty cache is too few
+    # slots, which the decode rule handles as under-batching.
+    if llama_on and (
+        max_kv >= t.kv_pressure_ratio
+        or (max_deferred >= 1 and max_kv >= t.kv_defer_pressure_ratio)
+    ):
         return _make(
             Verdict.KV_CACHE_PRESSURE,
             "warn",
@@ -342,33 +378,192 @@ def analyze(window: list[Snapshot], thresholds: Thresholds | None = None) -> Dia
             metrics,
         )
 
+    # --- Rule 3.5: GPU_OFFLOAD_PARTIAL; layers are running on the CPU. ------
+    # A *config fact* from the WorkloadSpec (n_gpu_layers < n_layers), so this is
+    # high-confidence and precisely fixable — and the single most common reason a
+    # one-GPU llama.cpp box runs far below its card. It outranks the symptom
+    # verdicts (decode / memory-headroom) it would otherwise masquerade as.
+    if spec is not None and spec.offload_fraction < 0.98 and active_frac >= 0.10:
+        n_tot = spec.n_layers
+        n_gpu = spec.n_gpu_layers
+        on_cpu = (n_tot - n_gpu) if (n_tot and n_gpu is not None) else None
+        model_gb = spec.model_bytes / 1e9 if spec.model_bytes else None
+        total_gb = mean_total_mb / 1024 if mean_total_mb else None
+        fits = model_gb is not None and total_gb is not None and model_gb * 1.15 <= total_gb
+        layers_str = (
+            f"{on_cpu} of {n_tot} layers"
+            if on_cpu is not None
+            else f"{(1 - spec.offload_fraction):.0%} of the model"
+        )
+        if fits:
+            fix = (
+                f"Restart llama-server with  -ngl 999  to put all "
+                f"{n_tot if n_tot else ''} layers on the GPU"
+                + (
+                    f" (the ~{model_gb:.1f} GB model fits in your ~{total_gb:.0f} GB of VRAM)."
+                    if (model_gb and total_gb)
+                    else "."
+                )
+            )
+        elif model_gb is not None and total_gb is not None:
+            fix = (
+                f"The model (~{model_gb:.1f} GB) is larger than this card's VRAM "
+                f"(~{total_gb:.0f} GB), so it can't be fully offloaded. Use a smaller "
+                "quant (e.g. Q4_K_M) that fits, or a card with more VRAM."
+            )
+        else:
+            fix = (
+                "Restart llama-server with  -ngl 999  to offload all layers to the "
+                "GPU (confirm the model fits in VRAM first)."
+            )
+        return _make(
+            Verdict.GPU_OFFLOAD_PARTIAL,
+            "warn",
+            min(0.95, 0.6 + (1.0 - spec.offload_fraction)),
+            f"{layers_str} are running on the CPU (only {spec.offload_fraction:.0%} "
+            "of the model is on the GPU). CPU-resident layers cap throughput far "
+            "below this card"
+            + (f"; generation is ~{gen_tps:.0f} tok/s." if gen_tps > 0 else "."),
+            [
+                f"GPU layers: {n_gpu if n_gpu is not None else '?'} / {n_tot if n_tot else '?'}",
+                f"On GPU: {spec.offload_fraction:.0%} of the model",
+                *([f"Generation: {gen_tps:.0f} tok/s"] if gen_tps > 0 else []),
+                *(
+                    [f"Model ~{model_gb:.1f} GB, VRAM ~{total_gb:.0f} GB"]
+                    if (model_gb and total_gb)
+                    else []
+                ),
+            ],
+            [
+                fix,
+                "Partial CPU offload is usually the single biggest throughput loss on "
+                "a one-GPU box; fixing -ngl often multiplies tokens/sec.",
+                "After the restart, ET verifies tokens/sec actually recovered and rolls "
+                "back automatically if it didn't.",
+            ],
+            metrics,
+        )
+
     # --- Rule 4: DECODE_BANDWIDTH_BOUND; generating but not saturated. ------
+    # With a roofline we can say *why* util is below 100%: at the single-stream
+    # memory-bandwidth wall (physics, not fixable by tuning util), under-batched
+    # with real queued demand (fixable: continuous batching), or below the wall
+    # on a fully-offloaded model (host/config-bound: threads / batch / flash-attn).
     decode_like = (
         active_frac >= 0.25
         and mean_util < t.busy_util_pct
         and (gen_tps > 0 or not llama_on)
     )
     if decode_like:
-        conc_note = ""
-        if llama_on:
-            mean_conc = _mean_or(window, "requests_processing", 0.0) or 0.0
-            conc_note = f" Mean concurrency was {mean_conc:.1f} request(s)."
+        single_stream = mean_conc <= 1.05 and max_deferred < 1
+        under_batching = max_deferred >= 1 or mean_conc > 1.05
+        # Roofline-only metrics: don't add them in the spec-absent (back-compat)
+        # path, so the metrics payload shape is unchanged when there's no spec.
+        if rl is not None:
+            metrics["single_stream"] = single_stream
+            metrics["under_batching"] = under_batching
+        mbu = rl.mbu if rl is not None else None
+        ceil = rl.ceiling_tok_s if rl is not None else None
+        conf = min(1.0, 0.5 + (t.busy_util_pct - mean_util) / 100)
+        evidence = [
+            f"Mean utilization: {mean_util:.0f}%",
+            f"Active fraction: {active_frac:.0%}",
+            *([f"Generation: {gen_tps:.0f} tok/s"] if gen_tps > 0 else []),
+            *([f"Memory-bandwidth use (MBU): {mbu:.0%}"] if mbu is not None else []),
+            *([f"Single-stream ceiling: ~{ceil:.0f} tok/s"] if ceil is not None else []),
+            *([f"Mean concurrency: {mean_conc:.1f} req"] if llama_on else []),
+        ]
+        if rl is not None and rl.at_bandwidth_wall and single_stream:
+            # At the physical wall: the honest "you can't hit 90% util" case.
+            metrics["at_practical_ceiling"] = True
+            return _make(
+                Verdict.DECODE_BANDWIDTH_BOUND,
+                "ok",
+                max(conf, 0.8),
+                f"Serving at ~{gen_tps:.0f} tok/s — about {mbu:.0%} of this card's "
+                f"memory bandwidth, i.e. near the single-stream decode ceiling "
+                f"(~{ceil:.0f} tok/s). This is physics: at concurrency 1, decode is "
+                "memory-bandwidth bound, so GPU utilization saturates below 100%. "
+                "Raising utilization to 90% single-stream is not achievable by tuning.",
+                evidence,
+                [
+                    "You are at the hardware limit for ONE stream. The lever is "
+                    "concurrency: serve more requests at once with  --parallel N "
+                    "--cont-batching  and aggregate tokens/sec climbs while util "
+                    "barely moves.",
+                    "For lower single-stream latency, add speculative decoding with a "
+                    "small draft model:  --model-draft <small.gguf> --draft 16 .",
+                    "A faster quant of the same model (e.g. Q4_K_M) raises the ceiling "
+                    "itself by shrinking bytes-per-token.",
+                    "Chasing nvidia-smi utilization here is a vanity metric — tokens/sec "
+                    "is already near optimal for a single stream.",
+                ],
+                metrics,
+            )
+        if under_batching:
+            return _make(
+                Verdict.DECODE_BANDWIDTH_BOUND,
+                "info",
+                conf,
+                f"Concurrent demand is queueing (up to {max_deferred:.0f} deferred, "
+                f"{mean_conc:.1f} in flight) while the GPU is only ~{mean_util:.0f}% "
+                + (f"busy (MBU {mbu:.0%}). " if mbu is not None else "busy. ")
+                + "Continuous batching would let these requests share each decode "
+                "step and lift throughput substantially.",
+                evidence,
+                [
+                    "Turn on continuous batching and add slots: restart llama-server "
+                    "with  --parallel <N> --cont-batching  (size N to your concurrent "
+                    "demand).",
+                    "Throughput climbs with concurrency while utilization barely moves, "
+                    "until you saturate memory bandwidth — that headroom is what you're "
+                    "leaving on the table.",
+                    "If KV cache gets tight as you add slots, quantize it:  --flash-attn "
+                    " --cache-type-k q8_0 --cache-type-v q8_0 .",
+                ],
+                metrics,
+            )
+        if (
+            rl is not None
+            and mbu is not None
+            and not rl.at_bandwidth_wall
+            and not rl.partial_offload
+        ):
+            # Fully offloaded, single stream, but well below the bandwidth wall:
+            # bandwidth is NOT the limit here — something host-side is.
+            metrics["host_or_config_suspect"] = True
+            return _make(
+                Verdict.DECODE_BANDWIDTH_BOUND,
+                "warn",
+                max(conf, 0.6),
+                f"Decoding at ~{gen_tps:.0f} tok/s but using only {mbu:.0%} of memory "
+                f"bandwidth — well below this card's ceiling (~{ceil:.0f} tok/s). "
+                "Bandwidth isn't the bottleneck; something host-side is (CPU sampling, "
+                "too-small a batch, or flash-attention off).",
+                evidence,
+                [
+                    "Make sure flash-attention is on:  --flash-attn  (big decode "
+                    "speedup, less KV traffic).",
+                    "Give the GPU more work per step: raise  -b / --ubatch-size ; check "
+                    " -t  (threads) matches your physical cores.",
+                    "Heavy samplers (deep top-k/min-p stacks, big grammars) run on the "
+                    "CPU between tokens and can serialize decode — simplify them if you "
+                    "can.",
+                    "If you actually have concurrent users, enable  --parallel N "
+                    "--cont-batching  to amortize the weight reads.",
+                ],
+                metrics,
+            )
+        # No roofline (or nothing more specific) -> the original message.
         return _make(
             Verdict.DECODE_BANDWIDTH_BOUND,
             "info",
-            min(1.0, 0.5 + (t.busy_util_pct - mean_util) / 100),
+            conf,
             f"Actively serving but GPU only ~{mean_util:.0f}% busy. Low-concurrency "
             "token generation is memory-bandwidth bound, so utilization plateaus "
-            "below 100%." + conc_note,
-            [
-                f"Mean utilization: {mean_util:.0f}%",
-                f"Active fraction: {active_frac:.0%}",
-                *(
-                    [f"Generation: {gen_tps:.0f} tok/s"]
-                    if gen_tps > 0
-                    else []
-                ),
-            ],
+            "below 100%."
+            + (f" Mean concurrency was {mean_conc:.1f} request(s)." if llama_on else ""),
+            evidence,
             [
                 "Turn on continuous batching so concurrent requests share each decode step: restart llama-server with  --parallel 4  (raise as load grows) and  --cont-batching .",
                 "Throughput climbs with concurrency while utilization barely moves, until you saturate memory bandwidth: that headroom is what you're leaving on the table.",

@@ -40,6 +40,12 @@ run.bat --gpu-price 0.50 --llama-url http://localhost:8080
 
 That's it. Leave it running.
 
+> **Tip — turn on the decode roofline.** Run `./run.sh --detect` once (it probes
+> llama-server, the model GGUF, and the GPU) to enable MBU / single-stream tok/s
+> ceiling / partial-offload diagnosis — so "40% utilized" becomes "40% of the
+> card's ceiling (fixable)" vs "at the single-stream wall (physics)". The monitor
+> also auto-detects this on first run when it can reach llama-server.
+
 ## 3. View from another computer (optional)
 
 To open the dashboard from your laptop instead of the GPU box, bind to the
@@ -100,6 +106,7 @@ shortcut to `run.bat` (with your args) in the Startup folder
 | Symptom | Fix |
 |---|---|
 | Dashboard says "llama-server: not found" | Start it with `--metrics`; check `--llama-url` matches its port |
+| No MBU / throughput-vs-ceiling panel | No workload spec yet — run `./run.sh --detect`; if your card's bandwidth is unknown, add `--gpu-bandwidth <GB/s>` |
 | "backend: mock" in the header | No NVIDIA GPU detected; install the driver, or `pip install nvidia-ml-py`; `nvidia-smi` must work |
 | Page won't load | Check the port isn't taken; try `--port 7071` |
 | Want a quick look without a GPU | `./run.sh --demo --gpu-price 0.50` plays a scripted timeline |

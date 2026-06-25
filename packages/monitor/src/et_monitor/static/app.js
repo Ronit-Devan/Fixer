@@ -129,6 +129,9 @@ function render(state) {
   }
   $("uptime").textContent = `session ${fmt((s.uptime_s || 0) / 60, 1)} min · idle ${fmt(s.idle_seconds || 0, 0)}s`;
 
+  // llama-not-found banner: the single most useful unblock line.
+  $("llama-banner").hidden = !!llamaOn;
+
   // tiles
   if (snap) {
     $("t-util").textContent = fmt(snap.util_pct, 0, "%");
@@ -140,6 +143,9 @@ function render(state) {
     $("t-req").textContent = snap.requests_processing != null ? fmt(snap.requests_processing, 0) : "-";
     $("t-kv").textContent = snap.kv_cache_usage_ratio != null ? fmt(snap.kv_cache_usage_ratio * 100, 0, "%") : "-";
   }
+
+  // Throughput-vs-ceiling panel (only when a workload spec gives us a roofline).
+  renderRoofline(snapshot, diagnosis, snap);
 
   // per-GPU strip (only when the box has more than one card)
   const gpus = (snapshot.gpus || []);
@@ -166,6 +172,52 @@ function render(state) {
   drawChart($("chart-mem"), tail.map((x) => x.mem_used_ratio != null ? x.mem_used_ratio * 100 : null), { max: 100, color: COLORS.ok });
   drawChart($("chart-tps"), tail.map((x) => x.gen_tokens_per_s), { color: COLORS.warn });
   drawChart($("chart-kv"), tail.map((x) => x.kv_cache_usage_ratio != null ? x.kv_cache_usage_ratio * 100 : null), { max: 100, color: COLORS.crit });
+}
+
+// ---- throughput vs the card's single-stream ceiling (resolves "40% of what?") --
+function renderRoofline(snapshot, diagnosis, snap) {
+  const card = $("roofline-card");
+  const wl = snapshot.workload;
+  const m = (diagnosis && diagnosis.metrics) || {};
+  const ceiling = (wl && wl.ceiling_tok_s) || m.ceiling_tok_s;
+  if (!wl || !ceiling) { card.hidden = true; return; }   // no spec -> no panel
+  card.hidden = false;
+
+  const model = [wl.model_name, wl.gpu_name].filter(Boolean).join(" · ") || "model";
+  $("roofline-model").textContent = model +
+    (wl.mem_bandwidth_gb_s ? ` · ${fmt(wl.mem_bandwidth_gb_s, 0)} GB/s` : "");
+
+  const now = snap ? snap.gen_tokens_per_s : null;
+  const tput = m.throughput_pct != null ? m.throughput_pct
+    : (now != null ? now / ceiling : null);
+  $("roofline-pct").textContent = tput != null ? fmt(tput * 100, 0, "%") : "-";
+  $("roofline-now").textContent = fmt(now, 0);
+  $("roofline-ceiling").textContent = fmt(ceiling, 0);
+  $("roofline-mbu").textContent = m.mbu != null ? fmt(m.mbu * 100, 0, "%") : "-";
+
+  // MBU bar: fill to MBU%, color by where we are vs the wall.
+  const mbuPct = m.mbu != null ? Math.min(100, m.mbu * 100) : 0;
+  const bar = $("mbu-bar");
+  bar.style.width = mbuPct + "%";
+  bar.className = m.at_practical_ceiling ? "at-wall"
+    : (m.partial_offload ? "offload" : (mbuPct > 0 ? "below" : ""));
+
+  // server-config chips (from /props) + offload chip.
+  const chips = [];
+  if (wl.n_layers) chips.push(`offload ${wl.n_gpu_layers != null ? wl.n_gpu_layers : "?"}/${wl.n_layers}`);
+  if (snap && snap.ctx_size) chips.push(`ctx ${snap.ctx_size}`);
+  if (snap && snap.total_slots) chips.push(`slots ${snap.total_slots}`);
+  if (snap && snap.cache_type_k) chips.push(`kv ${snap.cache_type_k}`);
+  if (snap && snap.cont_batching != null) chips.push(`cont-batch ${snap.cont_batching ? "on" : "off"}`);
+  $("roofline-chips").innerHTML = chips.map((c) => `<span class="chip">${c}</span>`).join("");
+
+  // One plain-language line explaining the gap (the "Why").
+  let note = "";
+  if (m.partial_offload) note = "Layers are on the CPU — raise -ngl to put the whole model on the GPU. This caps everything else.";
+  else if (m.at_practical_ceiling) note = "At the physical single-stream wall: util can't reach 90% at concurrency 1. Batch concurrent requests, add speculative decoding, or use a faster quant.";
+  else if (m.host_or_config_suspect) note = "Below the bandwidth wall — host-bound. Check --flash-attn, -t threads, and -b/--ubatch-size.";
+  else if (m.under_batching) note = "Concurrent demand is queueing — enable --parallel N --cont-batching to lift aggregate throughput.";
+  $("roofline-note").textContent = note;
 }
 
 async function poll() {

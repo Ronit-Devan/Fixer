@@ -32,8 +32,16 @@ class RootCause(str, Enum):
     DATA_PIPELINE_STARVATION = "data_pipeline_starvation"
     DISTRIBUTED_COMM_STALL = "distributed_comm_stall"
     SUBOPTIMAL_RUNTIME_FLAGS = "suboptimal_runtime_flags"
+    # Layers running on CPU (-ngl too low): restart llama-server with the whole
+    # model on the GPU. Disruptive (a restart), so always approval-gated.
+    PARTIAL_GPU_OFFLOAD = "partial_gpu_offload"
 
-    # --- nothing to remediate ---
+    # --- nothing to remediate (advise-only terminal) ---
+    # The box is at the physical single-stream memory-bandwidth wall. Restarting
+    # with different flags will NOT raise tokens/sec — the honest move is to
+    # explain (batching / spec-decode / quant) and take no action. No strategy is
+    # registered for this cause, so the engine advises and never opens a restart.
+    AT_PRACTICAL_CEILING = "at_practical_ceiling"
     NONE = "none"
 
 
@@ -44,6 +52,7 @@ _MONITOR_MAP: dict[str, RootCause] = {
     "decode_bandwidth_bound": RootCause.SUBOPTIMAL_RUNTIME_FLAGS,
     "memory_headroom": RootCause.SUBOPTIMAL_RUNTIME_FLAGS,
     "kv_cache_pressure": RootCause.SUBOPTIMAL_RUNTIME_FLAGS,
+    "gpu_offload_partial": RootCause.PARTIAL_GPU_OFFLOAD,
     # VRAM climbing toward OOM (a predictive verdict): try to reclaim stale VRAM
     # non-disruptively before the card OOMs and kills the workload.
     "vram_pressure": RootCause.MEMORY_FRAGMENTATION,
@@ -76,12 +85,19 @@ def map_monitor_verdict(verdict_value: str, metrics: dict | None = None) -> Root
     fix is utilization, not a knob), so it maps to NONE.
     """
     rc = _MONITOR_MAP.get(verdict_value, RootCause.NONE)
+    m = metrics or {}
     if rc is RootCause.IDLE_ZOMBIE_PROCESS:
-        m = metrics or {}
         resident = m.get("mem_used_ratio")
         # Only treat as a zombie-hold when memory is meaningfully resident.
         if resident is None or resident < 0.10:
             return RootCause.NONE
+    # Decode at the physical single-stream wall: a restart can't raise tokens/sec
+    # (it's memory-bandwidth limited), so route to the advise-only no-op cause
+    # instead of opening a pointless RESTART approval. The analyzer sets
+    # ``at_practical_ceiling`` only when MBU is at the wall AND concurrency is 1;
+    # under-batching / host-bound decode keep SUBOPTIMAL_RUNTIME_FLAGS (fixable).
+    if verdict_value == "decode_bandwidth_bound" and m.get("at_practical_ceiling"):
+        return RootCause.AT_PRACTICAL_CEILING
     return rc
 
 

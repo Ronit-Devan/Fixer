@@ -24,8 +24,10 @@ from et_monitor.alerts import (
     WebhookNotifier,
 )
 from et_monitor.demo import DemoGpuSampler, DemoLlamaScraper, DemoTimeline
+from et_monitor.detect import build_workload_spec, run_detect
 from et_monitor.gpu import get_gpu_sampler
 from et_monitor.llama import LlamaScraper
+from et_monitor.perf import WorkloadSpec, default_spec_path
 from et_monitor.server import create_app
 from et_monitor.state import Monitor, MonitorConfig
 
@@ -45,7 +47,7 @@ def _build_alert_manager(args: argparse.Namespace) -> AlertManager | None:
         host_label=args.host_label,
     )
     kinds = ", ".join(type(n).__name__ for n in notifiers)
-    print(f"  alerts on → {kinds} (idle>{args.alert_idle_min}m, cooldown {args.alert_cooldown_min}m)")
+    print(f"  alerts on -> {kinds} (idle>{args.alert_idle_min}m, cooldown {args.alert_cooldown_min}m)")
     return AlertManager(notifiers, cfg)
 
 
@@ -76,8 +78,19 @@ def _build_remediation_factory(args: argparse.Namespace, monitor: Monitor):
         )
         from et_remediation.setup_ui import run_setup
     except ImportError:
-        print("  remediation: et-remediation not installed; running advise-only.")
-        return None
+        # The user explicitly asked for remediation (we only get here when the
+        # mode isn't 'disabled' or --remediation-setup was passed). Fail fast and
+        # loud rather than silently running observe-only for weeks.
+        what = (
+            f"--remediation-mode {args.remediation_mode}"
+            if args.remediation_mode != "disabled"
+            else "--remediation-setup"
+        )
+        raise SystemExit(
+            f"ERROR: {what} requires the 'et-remediation' package, which isn't installed.\n"
+            "  Install it:  pip install -e ../remediation   (or: pip install et-remediation)\n"
+            "  Or omit the remediation flags to run the monitor in observe-only mode."
+        )
 
     cfg_path = args.remediation_config or str(default_config_path())
     cfg = RemediationConfig.load_or_default(cfg_path)
@@ -132,11 +145,53 @@ def _build_remediation_factory(args: argparse.Namespace, monitor: Monitor):
     return factory
 
 
+def _resolve_workload_spec(args: argparse.Namespace, gpu, llama) -> WorkloadSpec | None:
+    """Load the persisted roofline spec, or AUTO-DETECT it on first run so the
+    MBU / single-stream-ceiling / partial-offload diagnosis works without the
+    operator having to know about `--detect`. Absent => util-only heuristics.
+
+    A mock GPU's name is deliberately NOT used for bandwidth (it would map to a
+    real card's spec), and an auto-detected spec is only saved when it learned
+    something real (model size or layer count)."""
+    path = args.workload_spec or str(default_spec_path())
+    spec = WorkloadSpec.load_or_none(path)
+    if spec is not None:
+        print(f"  workload spec -> {path} (roofline: MBU / single-stream ceiling on)")
+        return spec
+    if args.no_llama or llama is None:
+        return None  # no server to introspect -> can't build a roofline unattended
+
+    gpu_name = None
+    if getattr(gpu, "backend", "") != "mock":
+        try:
+            readings = gpu.read()
+            gpu_name = readings[0].name if readings else None
+        except Exception:  # noqa: BLE001
+            gpu_name = None
+    try:
+        built, _notes = build_workload_spec(
+            gpu_name=gpu_name,
+            llama_url=args.llama_url,
+            model_path=args.model or None,
+            n_gpu_layers=args.ngl,
+            mem_bandwidth_gb_s=args.gpu_bandwidth,
+        )
+    except Exception:  # noqa: BLE001 — detection is best-effort, never fatal
+        return None
+    if built.model_bytes or built.n_layers:
+        try:
+            built.save(path)
+        except OSError:
+            pass
+        print(f"  workload spec -> auto-detected, saved to {path}")
+        if not built.has_roofline:
+            print("    (GPU memory bandwidth unknown; pass --gpu-bandwidth <GB/s> for MBU/ceiling.)")
+        return built
+    return None
+
+
 def _build_monitor(args: argparse.Namespace) -> Monitor:
-    config = MonitorConfig(
-        interval_s=args.interval,
-        gpu_hourly_usd=args.gpu_price,
-    )
+    config = MonitorConfig(interval_s=args.interval, gpu_hourly_usd=args.gpu_price)
     alerts = _build_alert_manager(args)
     host_label = args.host_label or socket.gethostname()
     if args.demo:
@@ -155,9 +210,33 @@ def _build_monitor(args: argparse.Namespace) -> Monitor:
     else:
         gpu = get_gpu_sampler(force_mock=args.mock)
         llama = None if args.no_llama else LlamaScraper(args.llama_url)
+        config.workload_spec = _resolve_workload_spec(args, gpu, llama)
         monitor = Monitor(gpu, llama, config, alert_manager=alerts, host_label=host_label)
     monitor.remediation_factory = _build_remediation_factory(args, monitor)
     return monitor
+
+
+def _print_startup_guidance(args: argparse.Namespace, monitor: Monitor) -> None:
+    """Surface manual-action items at startup (not buried in logs), so a headless
+    operator isn't left guessing why attribution or the roofline is missing."""
+    if args.demo:
+        return
+    if not args.no_llama and monitor.llama is not None:
+        try:
+            reachable = monitor.llama.read() is not None
+        except Exception:  # noqa: BLE001
+            reachable = False
+        if not reachable:
+            print(
+                f"  NOTE: llama-server metrics not reachable at {args.llama_url}.\n"
+                "        Start it with --metrics:  llama-server -m model.gguf --metrics\n"
+                "        (running in GPU-only mode until then)."
+            )
+    if monitor.config.workload_spec is None and not args.no_llama:
+        print(
+            "  NOTE: decode roofline off (no MBU / single-stream ceiling).\n"
+            "        Run once:  et-monitor --detect   to enable it."
+        )
 
 
 def main() -> None:
@@ -194,6 +273,35 @@ def main() -> None:
     )
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    # --- decode roofline / workload spec (resolves "40% of what?") ---
+    parser.add_argument(
+        "--detect",
+        action="store_true",
+        help="Probe llama-server + GGUF + GPU, print the decode ceiling, save the "
+        "workload spec, and exit. Run this once to turn on MBU/ceiling diagnosis.",
+    )
+    parser.add_argument(
+        "--workload-spec",
+        default="",
+        help="Path to the workload spec JSON (default ~/.et/workload.json).",
+    )
+    parser.add_argument(
+        "--model",
+        default="",
+        help="Path to the model .gguf (for --detect, when /props doesn't expose it).",
+    )
+    parser.add_argument(
+        "--ngl",
+        type=int,
+        default=None,
+        help="n_gpu_layers the server was launched with (for --detect offload check).",
+    )
+    parser.add_argument(
+        "--gpu-bandwidth",
+        type=float,
+        default=None,
+        help="Override GPU memory bandwidth in GB/s (for --detect, unknown cards).",
+    )
     # --- alerting ---
     parser.add_argument(
         "--slack-webhook",
@@ -258,13 +366,39 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.detect:
+        # One-shot: detect the workload, print the ceiling, persist, and exit.
+        gpu_name = None
+        gpu_mem_total_mb = None
+        try:
+            sampler = get_gpu_sampler(force_mock=args.mock)
+            readings = sampler.read()
+            if readings:
+                gpu_mem_total_mb = readings[0].mem_total_mb
+                # Don't let a mock GPU's name map to a real card's bandwidth.
+                if getattr(sampler, "backend", "") != "mock":
+                    gpu_name = readings[0].name
+        except Exception:  # noqa: BLE001
+            pass
+        run_detect(
+            gpu_name=gpu_name,
+            llama_url=None if args.no_llama else (args.llama_url or None),
+            model_path=args.model or None,
+            n_gpu_layers=args.ngl,
+            mem_bandwidth_gb_s=args.gpu_bandwidth,
+            gpu_mem_total_mb=gpu_mem_total_mb,
+            save_path=args.workload_spec or None,
+        )
+        return
+
     import uvicorn
 
     monitor = _build_monitor(args)
     app = create_app(monitor)
+    _print_startup_guidance(args, monitor)
 
     url = f"http://{args.host}:{args.port}/"
-    print(f"\n  ET monitor → {url}")
+    print(f"\n  ET monitor -> {url}")
     print("  (Ctrl-C to stop)\n")
     if not args.no_browser:
         threading.Thread(

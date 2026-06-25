@@ -47,6 +47,28 @@ def util_recovered(
     return post.mean_util_pct - pre.mean_util_pct >= min_gain_pct
 
 
+def throughput_recovered(
+    pre: WindowSummary,
+    post: WindowSummary,
+    *,
+    min_gain_frac: float = 0.05,
+    min_abs_tok_s: float = 0.5,
+) -> bool:
+    """Generation throughput (tokens/sec) actually rose after the fix.
+
+    This is the correct success signal for a llama.cpp tuning change — a
+    continuous-batching or -ngl fix lifts tokens/sec even when single-stream GPU
+    *utilization* is unchanged (and a bad tune can raise util while *lowering*
+    tokens/sec). Conservative: if either window lacks a token rate, recovery is
+    NOT proven (returns False) so an unverifiable restart rolls back rather than
+    being confirmed on absent data.
+    """
+    if pre.mean_gen_tokens_per_s is None or post.mean_gen_tokens_per_s is None:
+        return False
+    gain = post.mean_gen_tokens_per_s - pre.mean_gen_tokens_per_s
+    return gain >= min_abs_tok_s and gain >= pre.mean_gen_tokens_per_s * min_gain_frac
+
+
 def memory_freed(
     pre: WindowSummary, post: WindowSummary, *, min_drop_ratio: float = 0.10
 ) -> bool:

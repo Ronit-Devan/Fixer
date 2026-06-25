@@ -55,11 +55,26 @@ class AuditRecord:
 
 
 class AuditLog:
-    """Bounded in-memory ring + optional JSONL mirror."""
+    """Bounded in-memory ring + optional size-rotated JSONL mirror.
 
-    def __init__(self, *, maxlen: int = 1000, jsonl_path: str | Path | None = None) -> None:
+    The JSONL file is rotated once it passes ``max_bytes`` (``file.jsonl`` ->
+    ``file.jsonl.1`` -> ... -> ``file.jsonl.N``, oldest dropped), so a box left
+    running for months can't fill its disk with audit history. Default cap is
+    ~50 MB total (5 x 10 MB), plenty for a long ops trail.
+    """
+
+    def __init__(
+        self,
+        *,
+        maxlen: int = 1000,
+        jsonl_path: str | Path | None = None,
+        max_bytes: int = 10 * 1024 * 1024,
+        backup_count: int = 5,
+    ) -> None:
         self._records: deque[AuditRecord] = deque(maxlen=maxlen)
         self._path = Path(jsonl_path) if jsonl_path else None
+        self._max_bytes = max_bytes
+        self._backup_count = backup_count
         if self._path is not None:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,11 +86,37 @@ class AuditLog:
         self._records.append(rec)
         if self._path is not None:
             try:
+                # Rotate BEFORE writing when the file is already at the cap, so the
+                # live JSONL always exists and holds the most-recent records.
+                self._rotate_if_needed()
                 with self._path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(rec.to_dict()) + "\n")
             except OSError as e:  # pragma: no cover - defensive
                 log.warning("audit: append to %s failed: %s", self._path, e)
         return rec
+
+    def _rotate_if_needed(self) -> None:
+        """Roll the JSONL file over once it exceeds ``max_bytes``. Best-effort:
+        any rotation error is swallowed so audit writing never breaks remediation."""
+        if self._path is None or self._max_bytes <= 0:
+            return
+        try:
+            if self._path.stat().st_size < self._max_bytes:
+                return
+        except OSError:
+            return
+        try:
+            # Drop the oldest, shift each backup up one, then move current -> .1.
+            oldest = self._path.with_name(f"{self._path.name}.{self._backup_count}")
+            if oldest.exists():
+                oldest.unlink()
+            for i in range(self._backup_count - 1, 0, -1):
+                src = self._path.with_name(f"{self._path.name}.{i}")
+                if src.exists():
+                    src.replace(self._path.with_name(f"{self._path.name}.{i + 1}"))
+            self._path.replace(self._path.with_name(f"{self._path.name}.1"))
+        except OSError as e:  # pragma: no cover - defensive
+            log.warning("audit: rotation of %s failed: %s", self._path, e)
 
     def recent(self, limit: int | None = None) -> list[AuditRecord]:
         items = list(self._records)

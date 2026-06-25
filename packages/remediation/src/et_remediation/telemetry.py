@@ -74,6 +74,10 @@ class WindowSummary:
     min_mem_used_ratio: float | None
     mean_requests_processing: float | None
     max_kv_cache_ratio: float | None
+    # Generation throughput (tokens/sec). This — not util% — is the right success
+    # signal for a llama.cpp flag change: a batching/offload fix lifts tokens/sec
+    # while single-stream util barely moves. None when the source has no token rate.
+    mean_gen_tokens_per_s: float | None = None
 
 
 def summarize(samples: Sequence[object]) -> WindowSummary:
@@ -84,6 +88,7 @@ def summarize(samples: Sequence[object]) -> WindowSummary:
     memr = _vals(samples, _mem_ratio)
     reqs = _vals(samples, lambda s: _get(s, "requests_processing"))
     kv = _vals(samples, lambda s: _get(s, "kv_cache_usage_ratio"))
+    tps = _vals(samples, lambda s: _get(s, "gen_tokens_per_s"))
     return WindowSummary(
         n=len(samples),
         mean_util_pct=mean(util) if util else None,
@@ -94,4 +99,5 @@ def summarize(samples: Sequence[object]) -> WindowSummary:
         min_mem_used_ratio=min(memr) if memr else None,
         mean_requests_processing=mean(reqs) if reqs else None,
         max_kv_cache_ratio=max(kv) if kv else None,
+        mean_gen_tokens_per_s=mean(tps) if tps else None,
     )

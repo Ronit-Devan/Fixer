@@ -23,6 +23,13 @@
   </header>
 
   <main>
+    <!-- Shown only when llama-server isn't reachable: the one thing to fix. -->
+    <section class="banner" id="llama-banner" hidden>
+      <strong>llama-server not found.</strong> Start it with <code>--metrics</code> (and run
+      <code>et-monitor --detect</code> once) to unlock tokens/sec, MBU and the decode ceiling.
+      Running in GPU-only mode for now.
+    </section>
+
     <!-- Hero: verdict + cost -->
     <section class="hero">
       <div class="card verdict" id="verdict-card">
@@ -52,12 +59,35 @@
 
     <!-- Live tiles -->
     <section class="tiles">
-      <div class="tile"><div class="tile-label">GPU util</div><div class="tile-val" id="t-util">-</div></div>
+      <div class="tile" title="nvidia-smi compute utilization — NOT throughput. Single-stream decode saturates this below 100% even when tokens/sec is optimal.">
+        <div class="tile-label">GPU util</div><div class="tile-val" id="t-util">-</div><div class="tile-sub">compute · nvidia-smi</div></div>
       <div class="tile"><div class="tile-label">VRAM</div><div class="tile-val" id="t-mem">-</div><div class="tile-sub" id="t-mem-sub"></div></div>
       <div class="tile"><div class="tile-label">Power</div><div class="tile-val" id="t-power">-</div></div>
-      <div class="tile"><div class="tile-label">Gen tok/s</div><div class="tile-val" id="t-tps">-</div></div>
+      <div class="tile" title="Generation throughput — the number that actually matters for a user.">
+        <div class="tile-label">Gen tok/s</div><div class="tile-val" id="t-tps">-</div><div class="tile-sub" id="t-tps-sub"></div></div>
       <div class="tile"><div class="tile-label">Requests</div><div class="tile-val" id="t-req">-</div></div>
       <div class="tile"><div class="tile-label">KV cache</div><div class="tile-val" id="t-kv">-</div></div>
+    </section>
+
+    <!-- Throughput vs the card's single-stream ceiling: the answer to "40% of what?" -->
+    <section class="card roofline" id="roofline-card" hidden>
+      <div class="roofline-head">
+        <div>
+          <div class="recs-label">Throughput vs this card's single-stream ceiling</div>
+          <div class="roofline-model" id="roofline-model">-</div>
+        </div>
+        <div class="roofline-pct"><span id="roofline-pct">-</span><small>of achievable ceiling</small></div>
+      </div>
+      <div class="mbu-bar" title="Memory-bandwidth utilization. The marker is the single-stream wall (~70%); past it, only batching / speculative decoding / a faster quant can go higher.">
+        <span id="mbu-bar"></span><i class="mbu-wall"></i>
+      </div>
+      <div class="roofline-row">
+        <span>now <strong id="roofline-now">-</strong> tok/s</span>
+        <span>ceiling <strong id="roofline-ceiling">-</strong> tok/s</span>
+        <span>MBU <strong id="roofline-mbu">-</strong></span>
+      </div>
+      <div class="roofline-chips" id="roofline-chips"></div>
+      <div class="roofline-note" id="roofline-note"></div>
     </section>
 
     <!-- Per-GPU strip (multi-GPU boxes only) -->

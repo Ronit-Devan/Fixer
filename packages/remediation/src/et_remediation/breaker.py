@@ -39,8 +39,12 @@ class _NodeState:
     consecutive_failures: int = 0
     opened_at: float | None = None
     trip_reason: str = ""
-    # timestamps of recent applies (rate cap) and recent (kind, ts) (flap).
-    apply_times: deque = field(default_factory=deque)
+    # timestamps of recent applies (rate cap) and recent (kind, ts) (flap). Both
+    # are time-window-evicted, but also carry a maxlen so a fix that flaps for
+    # days WITHOUT ever recovering (record_success, which clears them, never
+    # runs) can't grow them without bound. The caps are far above any real
+    # window's worth of entries, so they never affect rate/flap detection.
+    apply_times: deque = field(default_factory=lambda: deque(maxlen=1024))
     kind_times: dict = field(default_factory=dict)  # kind -> deque[ts]
 
 
@@ -103,7 +107,7 @@ class CircuitBreaker:
         ns.apply_times.append(now)
         self._evict(ns.apply_times, now, self.caps.window_s)
 
-        times = ns.kind_times.setdefault(kind, deque())
+        times = ns.kind_times.setdefault(kind, deque(maxlen=1024))
         times.append(now)
         self._evict(times, now, self.caps.flap_window_s)
         if len(times) >= self.caps.flap_threshold and ns.state is not BreakerState.OPEN:

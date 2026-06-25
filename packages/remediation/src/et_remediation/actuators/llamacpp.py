@@ -23,15 +23,26 @@ from et_remediation.actuators.base import Actuator, ActuationState, CommandRunne
 
 log = logging.getLogger(__name__)
 
-# The runtime-tunable llama-server flags a restart strategy may set.
+# The runtime-tunable llama-server flags a restart strategy may set (value flags).
 _FLAG_MAP: dict[str, str] = {
     "n_gpu_layers": "-ngl",
     "threads": "-t",
     "batch_size": "-b",
+    "ubatch_size": "--ubatch-size",
     "ctx_size": "--ctx-size",
     "parallel": "--parallel",
     "cache_type_k": "--cache-type-k",
     "cache_type_v": "--cache-type-v",
+    "model_draft": "--model-draft",  # speculative decoding draft model
+    "draft": "--draft",
+}
+
+# Boolean (presence-only) flags: included when the param is truthy.
+_BOOL_FLAG_MAP: dict[str, str] = {
+    "mlock": "--mlock",
+    "no_mmap": "--no-mmap",
+    "cont_batching": "--cont-batching",
+    "flash_attn": "--flash-attn",
 }
 
 
@@ -72,10 +83,9 @@ class LlamaCppActuator(Actuator):
         for key, flag in _FLAG_MAP.items():
             if key in p and p[key] is not None:
                 argv += [flag, str(p[key])]
-        if p.get("mlock"):
-            argv += ["--mlock"]
-        if p.get("no_mmap"):
-            argv += ["--no-mmap"]
+        for key, flag in _BOOL_FLAG_MAP.items():
+            if p.get(key):
+                argv += [flag]
         return argv
 
     # -- drain ---------------------------------------------------------------

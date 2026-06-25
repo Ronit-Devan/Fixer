@@ -81,19 +81,31 @@ class GpuSampler(ABC):
 class NvmlGpuSampler(GpuSampler):
     backend = "nvml"
 
+    # Consecutive all-sensors-dead reads before we attempt to re-open NVML
+    # handles (a driver reset / GPU-fell-off-the-bus invalidates them). Small so
+    # we recover within a few seconds, but >1 so a single transient hiccup
+    # doesn't trigger a re-init storm.
+    _RECOVER_AFTER_DEAD_TICKS = 3
+
     def __init__(self, indices: Sequence[int] | None = None) -> None:
         import pynvml  # raises ImportError if unavailable
 
         pynvml.nvmlInit()
         self._pynvml = pynvml
-        total = pynvml.nvmlDeviceGetCount()
-        wanted = list(range(total)) if indices is None else list(indices)
+        self._wanted = list(indices) if indices is not None else None
         self._handles: list[tuple[int, object]] = []
-        for i in wanted:
-            if 0 <= i < total:
-                self._handles.append((i, pynvml.nvmlDeviceGetHandleByIndex(i)))
+        self._open_handles()
         if not self._handles:
             raise RuntimeError("NVML initialised but no GPU handles opened")
+        self._dead_ticks = 0  # consecutive reads where every sensor was None
+
+    def _open_handles(self) -> None:
+        nv = self._pynvml
+        total = nv.nvmlDeviceGetCount()
+        wanted = list(range(total)) if self._wanted is None else self._wanted
+        self._handles = [
+            (i, nv.nvmlDeviceGetHandleByIndex(i)) for i in wanted if 0 <= i < total
+        ]
 
     def gpu_count(self) -> int:
         return len(self._handles)
@@ -104,7 +116,38 @@ class NvmlGpuSampler(GpuSampler):
         out: list[GpuReading] = []
         for index, h in self._handles:
             out.append(self._read_one(nv, h, index, now))
+        self._track_liveness_and_maybe_recover(out)
         return out
+
+    def _track_liveness_and_maybe_recover(self, readings: list[GpuReading]) -> None:
+        """Detect a sustained all-dead state (driver reset / GPU lost) and try to
+        re-open NVML handles, so the monitor resumes instead of reporting None
+        forever. Only the failure path does any work; healthy reads just reset."""
+        any_live = any(
+            r.util_pct is not None or r.mem_used_mb is not None or r.power_w is not None
+            for r in readings
+        )
+        if any_live:
+            self._dead_ticks = 0
+            return
+        self._dead_ticks += 1
+        # Retry on the threshold tick, then every Nth tick after (cheap backoff).
+        if self._dead_ticks < self._RECOVER_AFTER_DEAD_TICKS:
+            return
+        if (self._dead_ticks - self._RECOVER_AFTER_DEAD_TICKS) % self._RECOVER_AFTER_DEAD_TICKS:
+            return
+        nv = self._pynvml
+        try:
+            try:
+                nv.nvmlShutdown()
+            except Exception:  # noqa: BLE001 — shutdown may itself fail post-loss
+                pass
+            nv.nvmlInit()
+            self._open_handles()
+            log.info("NVML re-initialised after %d dead reads (GPU recovered?).", self._dead_ticks)
+            self._dead_ticks = 0
+        except Exception as e:  # noqa: BLE001 — still gone; keep degrading to None
+            log.warning("NVML recovery attempt failed; GPU still unreachable (%s).", e)
 
     def _read_one(self, nv, h, index: int, now: float) -> GpuReading:
         def _try(fn, default=None):

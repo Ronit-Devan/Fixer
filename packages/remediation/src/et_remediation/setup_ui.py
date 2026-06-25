@@ -73,6 +73,28 @@ def run_setup(
         if win:
             cfg.verify_window_s = float(win)
 
+    # llama.cpp tuning knobs: what a RESTART_LLAMA_SERVER fix needs to actually
+    # relaunch the server (raise -ngl, add slots). Optional — the strategies have
+    # safe defaults (-ngl 999, demand-gated --parallel) when these are absent.
+    ask = input_fn(
+        "Configure llama.cpp tuning for auto-fixes (model / layers / restart cmd)? [y/N]: "
+    ).strip().lower()
+    if ask.startswith("y"):
+        model = input_fn("  Model .gguf path []: ").strip()
+        if model:
+            cfg.knobs["model"] = model
+        layers = input_fn(
+            "  Model layer count (enables '-ngl all' on partial offload) []: "
+        ).strip()
+        if layers:
+            try:
+                cfg.knobs["model_n_layers"] = int(layers)
+            except ValueError:
+                pass
+        restart = input_fn("  Command to relaunch llama-server []: ").strip()
+        if restart:
+            cfg.knobs["restart_command"] = restart.split()
+
     cfg.configured = True
     save_path = Path(path) if path else default_config_path()
     cfg.save(save_path)

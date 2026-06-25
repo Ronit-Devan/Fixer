@@ -56,6 +56,7 @@ def test_setup_wizard_writes_config(tmp_path):
         "live-job",     # label
         "5",            # max actions/window
         "15",           # verify window
+        "n",            # decline llama-tuning knobs
     ])
     out_lines = []
     p = tmp_path / "remediation.json"
@@ -72,6 +73,26 @@ def test_setup_wizard_writes_config(tmp_path):
     assert cfg.configured is True
     # Persisted and reloadable.
     assert RemediationConfig.load(p).mode is RemediationMode.AUTO
+
+
+def test_setup_wizard_captures_llama_knobs(tmp_path):
+    answers = iter([
+        "2",                       # mode -> advise
+        "",                        # no protected pids
+        "",                        # no label
+        "y",                       # configure llama tuning
+        "/models/qwen.gguf",       # model path
+        "32",                      # model layer count
+        "systemctl restart llama", # restart command
+    ])
+    cfg = run_setup(
+        input_fn=lambda prompt: next(answers, ""),
+        print_fn=lambda s: None,
+        path=tmp_path / "r.json",
+    )
+    assert cfg.knobs["model"] == "/models/qwen.gguf"
+    assert cfg.knobs["model_n_layers"] == 32
+    assert cfg.knobs["restart_command"] == ["systemctl", "restart", "llama"]
 
 
 def test_setup_wizard_defaults_to_advise_on_empty(tmp_path):

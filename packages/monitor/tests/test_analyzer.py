@@ -68,9 +68,20 @@ def test_kv_cache_pressure_on_high_ratio():
 
 
 def test_kv_cache_pressure_on_deferred():
-    w = _window(util_pct=70.0, kv_cache_usage_ratio=0.5, requests_deferred=2.0,
+    # Deferral WITH a contended cache (>= kv_defer_pressure_ratio) is real KV pressure.
+    w = _window(util_pct=70.0, kv_cache_usage_ratio=0.85, requests_deferred=2.0,
                 requests_processing=4.0, mem_used_mb=22000.0)
     assert analyze(w, T).verdict == Verdict.KV_CACHE_PRESSURE
+
+
+def test_deferred_with_empty_cache_is_under_batching_not_kv_pressure():
+    # Requests queued but the cache is near-empty -> too few slots (under-batching),
+    # NOT cache pressure. Must NOT recommend "lower --parallel".
+    w = _window(util_pct=55.0, kv_cache_usage_ratio=0.25, requests_deferred=2.0,
+                requests_processing=4.0, gen_tokens_per_s=60.0, mem_used_mb=12000.0)
+    d = analyze(w, T)
+    assert d.verdict == Verdict.DECODE_BANDWIDTH_BOUND
+    assert any("--parallel" in r and "cont-batching" in r.lower() for r in d.recommendations)
 
 
 def test_thermal_throttle_beats_everything():

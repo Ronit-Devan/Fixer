@@ -29,6 +29,7 @@ from et_remediation.rootcause import RootCause
 from et_remediation.verify import (
     clock_recovered,
     memory_freed,
+    throughput_recovered,
     util_recovered,
 )
 
@@ -117,17 +118,86 @@ def _build_restart_nccl(ctx: ActionContext) -> dict:
     }
 
 
+_QUANTIZED_KV = frozenset({"q8_0", "q4_0", "q4_1", "q5_0", "q5_1"})
+
+
+def _has_demand(m: dict) -> bool:
+    """Is there real concurrent demand to justify adding parallel slots?
+
+    Adding ``--parallel`` on a single-user box wastes KV cache and can *hurt*
+    single-stream latency, so we only raise it when requests are actually
+    queueing or more than one is in flight."""
+    deferred = m.get("max_requests_deferred") or 0
+    conc = m.get("mean_concurrency", m.get("mean_requests_processing")) or 0
+    return deferred >= 1 or conc > 1.05
+
+
 def _build_restart_llama(ctx: ActionContext) -> dict:
+    """Tuned llama-server restart params, derived from the live signal.
+
+    Demand-gated and headroom-capped so the restart improves throughput without
+    regressing a single-user box or risking OOM:
+      * ``--parallel`` is only raised above current when there's concurrent demand;
+      * ``-ngl`` defaults to the model's full layer count, but is NOT raised when
+        VRAM is already near full (that would OOM on reload);
+      * KV cache is only quantized when it isn't already.
+    """
+    m = ctx.metrics
+    k = ctx.knobs
+    params: dict = {
+        "model": k.get("model"),
+        "restart_command": k.get("restart_command"),
+        "prior_argv": k.get("prior_argv", []),
+        "drain_timeout_s": k.get("drain_timeout_s", 30.0),
+    }
+
+    # parallel: hold current unless there is genuine concurrent demand.
+    if _has_demand(m):
+        params["parallel"] = int(k.get("target_parallel", 4))
+        params["cont_batching"] = True
+    elif k.get("parallel") is not None:
+        params["parallel"] = int(k["parallel"])
+
+    # -ngl: full offload by default; never add layers into an almost-full card.
+    mem_ratio = m.get("mem_used_ratio")
+    if mem_ratio is not None and mem_ratio >= 0.90:
+        if k.get("n_gpu_layers") is not None:
+            params["n_gpu_layers"] = int(k["n_gpu_layers"])  # hold; don't grow
+    else:
+        params["n_gpu_layers"] = int(k.get("n_gpu_layers", k.get("model_n_layers", 999)))
+
+    # KV cache: quantize only if it isn't already (avoid needless quality changes).
+    if str(k.get("current_cache_type_k", "")).lower() not in _QUANTIZED_KV:
+        params["cache_type_k"] = k.get("cache_type_k", "q8_0")
+        params["cache_type_v"] = k.get("cache_type_v", "q8_0")
+
+    if k.get("mlock", True):
+        params["mlock"] = True
+    return params
+
+
+def _build_fix_offload(ctx: ActionContext) -> dict:
+    """Restart with the WHOLE model on the GPU. Refuses when it can't help.
+
+    Raises (so the engine falls through to advise) when VRAM is already near full
+    or the model provably won't fit — in those cases ``-ngl 999`` would OOM and
+    the right answer is a smaller quant, which the monitor already advises."""
+    m = ctx.metrics
+    k = ctx.knobs
+    mem_ratio = m.get("mem_used_ratio")
+    if mem_ratio is not None and mem_ratio >= 0.90:
+        raise ValueError("VRAM already near full; raising -ngl would risk OOM")
+    model_gb = k.get("model_size_gb")
+    vram_gb = k.get("vram_total_gb")
+    if model_gb and vram_gb and float(model_gb) * 1.1 > float(vram_gb):
+        raise ValueError("model does not fit VRAM; advise a smaller quant instead")
     return {
-        "model": ctx.knobs.get("model"),
-        "restart_command": ctx.knobs.get("restart_command"),
-        "prior_argv": ctx.knobs.get("prior_argv", []),
-        "n_gpu_layers": ctx.knobs.get("n_gpu_layers", 999),
-        "parallel": ctx.knobs.get("parallel", 4),
-        "cache_type_k": ctx.knobs.get("cache_type_k", "q8_0"),
-        "cache_type_v": ctx.knobs.get("cache_type_v", "q8_0"),
-        "mlock": ctx.knobs.get("mlock", True),
-        "drain_timeout_s": ctx.knobs.get("drain_timeout_s", 30.0),
+        "model": k.get("model"),
+        "restart_command": k.get("restart_command"),
+        "prior_argv": k.get("prior_argv", []),
+        "n_gpu_layers": int(k.get("model_n_layers", 999)),
+        "mlock": k.get("mlock", True),
+        "drain_timeout_s": k.get("drain_timeout_s", 30.0),
     }
 
 
@@ -208,9 +278,23 @@ SUBOPTIMAL_RUNTIME_FLAGS = ActionSpec(
     kind=ActionKind.RESTART_LLAMA_SERVER,
     action_class=ActionClass.DISRUPTIVE,
     reversible=True,
-    summary="Restart llama-server with tuned flags (-ngl/-t/-b/cache-type/--mlock).",
+    summary="Restart llama-server with tuned flags (-ngl/-b/--parallel/cache-type/--mlock).",
     build_params=_build_restart_llama,
-    recovered=util_recovered,
+    # Success is more tokens/sec, NOT more util%: a continuous-batching tune lifts
+    # throughput while single-stream utilization barely moves (and a bad tune can
+    # raise util while lowering tok/s). Verify on the metric that actually matters.
+    recovered=throughput_recovered,
+    requires_drain=True,
+)
+
+PARTIAL_GPU_OFFLOAD = ActionSpec(
+    root_cause=RootCause.PARTIAL_GPU_OFFLOAD,
+    kind=ActionKind.RESTART_LLAMA_SERVER,
+    action_class=ActionClass.DISRUPTIVE,
+    reversible=True,
+    summary="Restart llama-server with the whole model on the GPU (-ngl 999).",
+    build_params=_build_fix_offload,
+    recovered=throughput_recovered,
     requires_drain=True,
 )
 
@@ -223,6 +307,7 @@ ALL_STRATEGIES: list[ActionSpec] = [
     DATA_PIPELINE_STARVATION,
     DISTRIBUTED_COMM_STALL,
     SUBOPTIMAL_RUNTIME_FLAGS,
+    PARTIAL_GPU_OFFLOAD,
 ]
 
 

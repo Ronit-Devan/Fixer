@@ -29,7 +29,7 @@ et-remediation = { path = "../remediation" }
 et-monitor = "et_monitor.__main__:main"
 
 [project.urls]
-Repository = "https://github.com/devan-p/ET"
+Repository = "https://github.com/Ronit-Devan/Fixer/tree/main/packages/monitor"
 
 [build-system]
 requires = ["hatchling"]

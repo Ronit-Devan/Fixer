@@ -6,7 +6,7 @@
 # they survive you closing the terminal.
 #
 # Usage (on the pod's terminal):
-#   curl -fsSL https://raw.githubusercontent.com/devan-p/ET/main/packages/monitor/setup-on-gpu.sh | GPU_PRICE=0.69 bash
+#   curl -fsSL https://raw.githubusercontent.com/Ronit-Devan/Fixer/main/packages/monitor/setup-on-gpu.sh | GPU_PRICE=0.69 bash
 #
 # Override anything via env vars:
 #   MODEL=bartowski/Qwen2.5-3B-Instruct-GGUF:Q4_K_M  GPU_PRICE=0.69  MON_PORT=7070  bash setup-on-gpu.sh
@@ -48,10 +48,22 @@ tmux new-session -d -s llama \
   "$SERVER -hf $MODEL --host 0.0.0.0 --port $LLAMA_PORT --metrics -ngl 999 2>&1 | tee $WORK/llama.log"
 
 echo "==> [4/4] starting the ET monitor"
-[ -d ET ] || git clone --depth 1 https://github.com/devan-p/ET
+[ -d Fixer ] || git clone --depth 1 https://github.com/Ronit-Devan/Fixer
+MON_DIR="$WORK/Fixer/packages/monitor"
+
+# Wait for llama-server to finish loading the model (download can take minutes),
+# then capture the decode roofline (model size + layers + GPU bandwidth) so the
+# monitor has MBU / single-stream-ceiling / partial-offload from the first tick.
+echo "    waiting for llama-server, then detecting the decode roofline..."
+for _ in $(seq 1 90); do
+  curl -fsS "http://localhost:$LLAMA_PORT/props" >/dev/null 2>&1 && break
+  sleep 5
+done
+( cd "$MON_DIR" && ./run.sh --detect --llama-url "http://localhost:$LLAMA_PORT" 2>&1 | tee -a "$WORK/monitor.log" ) || true
+
 tmux kill-session -t monitor 2>/dev/null || true
 tmux new-session -d -s monitor \
-  "cd $WORK/ET/packages/monitor && ./run.sh --gpu-price $GPU_PRICE --llama-url http://localhost:$LLAMA_PORT --host 0.0.0.0 --port $MON_PORT --no-browser 2>&1 | tee $WORK/monitor.log"
+  "cd $MON_DIR && ./run.sh --gpu-price $GPU_PRICE --llama-url http://localhost:$LLAMA_PORT --host 0.0.0.0 --port $MON_PORT --no-browser 2>&1 | tee $WORK/monitor.log"
 
 cat <<EOF
 

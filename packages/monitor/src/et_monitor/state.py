@@ -23,7 +23,8 @@ from dataclasses import dataclass
 
 from et_monitor.analyzer import Thresholds, analyze
 from et_monitor.gpu import GpuSampler
-from et_monitor.llama import LlamaMetrics, LlamaScraper
+from et_monitor.llama import LlamaMetrics, LlamaProps, LlamaScraper
+from et_monitor.perf import WorkloadSpec, roofline
 from et_monitor.types import Diagnosis, Snapshot, Verdict
 
 # Verdicts quiescent enough to back the sample rate off on: a healthy box or a
@@ -53,6 +54,10 @@ class MonitorConfig:
     adaptive_sampling: bool = True
     max_interval_s: float = 5.0
     stable_ticks_to_backoff: int = 5  # consecutive quiescent ticks before growing
+    # Static hardware+model facts for the decode roofline (MBU / single-stream
+    # ceiling / partial-offload detection). None => the analyzer falls back to its
+    # util-based heuristics. Captured once at setup (et-monitor detect).
+    workload_spec: WorkloadSpec | None = None
 
     def __post_init__(self) -> None:
         if self.thresholds is None:
@@ -121,10 +126,19 @@ class _GpuTrack:
             self.util_peak = max(self.util_peak, snap.util_pct)
 
     def window(self) -> list[Snapshot]:
-        """Trailing window, walked newest-first with an early break (O(window))."""
-        cutoff = time.time() - self.config.window_seconds
+        """Trailing window, walked newest-first (O(window)).
+
+        Skips any sample stamped in the *future* relative to ``now``: an NTP step
+        backward can leave stale samples timestamped after the current clock, and
+        returning them would feed a non-monotonic time series to the trend
+        regression (corrupting predictive verdicts). They age out of the deque
+        within a window's worth of ticks, so the skip is transient."""
+        now = time.time()
+        cutoff = now - self.config.window_seconds
         out: list[Snapshot] = []
         for s in reversed(self.history):
+            if s.timestamp_s > now:
+                continue  # stale 'future' sample after a backward clock step
             if s.timestamp_s < cutoff:
                 break
             out.append(s)
@@ -204,7 +218,10 @@ class Monitor:
             # Account the REAL time since the last tick (not a fixed nominal),
             # so idle-seconds / wasted-$ / verdict-time stay correct under the
             # variable cadence the adaptive scheduler produces.
-            dt = self._interval_s if last_tick is None else (tick_start - last_tick)
+            # Guard against a backward clock step (NTP correction on an edge box):
+            # a negative dt would corrupt idle/uptime/verdict-time accounting. Treat
+            # a backward jump as zero elapsed for this tick.
+            dt = self._interval_s if last_tick is None else max(0.0, tick_start - last_tick)
             last_tick = tick_start
             try:
                 self.tick(dt=dt)
@@ -324,12 +341,23 @@ class Monitor:
         # llama-server metrics are box-level (one server) — read once and attach
         # to every GPU's snapshot. Token rates derive from box-level counters.
         lm = self.llama.read() if self.llama else None
+        # Static launch config (ctx/slots/cache types) — cached after first read,
+        # so this is a dict lookup on every tick but the first few. Optional on the
+        # scraper (demo/custom scrapers may not implement it), so probe by attr.
+        _read_props = getattr(self.llama, "read_props", None) if self.llama else None
+        props: LlamaProps | None = _read_props() if _read_props else None
         gen_tps = prompt_tps = None
         if lm is not None and self._prev_llama is not None:
             ldt = lm.timestamp_s - self._prev_llama.timestamp_s
             gen_tps = _rate(self._prev_llama.predicted_tokens_total, lm.predicted_tokens_total, ldt)
             prompt_tps = _rate(self._prev_llama.prompt_tokens_total, lm.prompt_tokens_total, ldt)
-        if lm is not None:
+        # Advance the rate baseline only when time did not go backward, so token
+        # rates and snapshot timestamps stay monotonic across an NTP step. A
+        # counter RESET (server restart) still advances it (its timestamp moves
+        # forward), so rates resume cleanly after the restart.
+        if lm is not None and (
+            self._prev_llama is None or lm.timestamp_s >= self._prev_llama.timestamp_s
+        ):
             self._prev_llama = lm
 
         if not readings:
@@ -355,6 +383,11 @@ class Monitor:
                 kv_cache_usage_ratio=lm.kv_cache_usage_ratio if lm else None,
                 gen_tokens_per_s=gen_tps,
                 prompt_tokens_per_s=prompt_tps,
+                ctx_size=props.ctx_size if props else None,
+                total_slots=props.total_slots if props else None,
+                cache_type_k=props.cache_type_k if props else None,
+                cache_type_v=props.cache_type_v if props else None,
+                cont_batching=props.cont_batching if props else None,
             )
             with self._lock:
                 track = self._tracks.get(index)
@@ -366,7 +399,7 @@ class Monitor:
                 window = track.window()  # one tail-walk per GPU, reused below
 
             try:
-                diag = analyze(window, self.config.thresholds)
+                diag = analyze(window, self.config.thresholds, self.config.workload_spec)
             except Exception:  # noqa: BLE001
                 diag = None
             track.last_diag = diag
@@ -449,6 +482,9 @@ class Monitor:
             "host_label": self.host_label,
             "gpu_count": len(tracks),
             "latest": _snap_to_dict(latest) if latest else None,
+            # Static workload facts + the single-stream ceiling, so the dashboard
+            # can frame tokens/sec against the card's limit even while idle.
+            "workload": _workload_dict(self.config.workload_spec),
             # Self-reported overhead so "minimal overhead" is observable, not
             # folklore: smoothed per-tick wall cost + the live (adaptive) cadence.
             "perf": {
@@ -574,12 +610,31 @@ class Monitor:
             idx = index if index is not None else self._primary
             tr = self._tracks.get(idx) if idx is not None else None
             window = tr.window() if tr else []
-        return analyze(window, self.config.thresholds)
+        return analyze(window, self.config.thresholds, self.config.workload_spec)
 
     def diagnosis_all(self) -> dict[int, Diagnosis]:
         with self._lock:
             items = [(i, self._tracks[i].window()) for i in sorted(self._tracks)]
-        return {i: analyze(w, self.config.thresholds) for i, w in items}
+        spec = self.config.workload_spec
+        return {i: analyze(w, self.config.thresholds, spec) for i, w in items}
+
+
+def _workload_dict(spec: WorkloadSpec | None) -> dict | None:
+    """The persisted workload spec + its single-stream ceiling, for the UI."""
+    if spec is None:
+        return None
+    rl = roofline(spec, None)
+    return {
+        "model_name": spec.model_name,
+        "gpu_name": spec.gpu_name,
+        "mem_bandwidth_gb_s": spec.mem_bandwidth_gb_s,
+        "model_gb": round(spec.model_bytes / 1e9, 2) if spec.model_bytes else None,
+        "n_layers": spec.n_layers,
+        "n_gpu_layers": spec.n_gpu_layers,
+        "offload_fraction": round(spec.offload_fraction, 3),
+        "ceiling_tok_s": round(rl.ceiling_tok_s, 1) if (rl and rl.ceiling_tok_s) else None,
+        "ideal_tok_s": round(rl.ideal_tok_s, 1) if (rl and rl.ideal_tok_s) else None,
+    }
 
 
 def tick_time(gr, lm) -> float:
@@ -609,4 +664,9 @@ def _snap_to_dict(s: Snapshot) -> dict:
         "kv_cache_usage_ratio": s.kv_cache_usage_ratio,
         "gen_tokens_per_s": s.gen_tokens_per_s,
         "prompt_tokens_per_s": s.prompt_tokens_per_s,
+        "ctx_size": s.ctx_size,
+        "total_slots": s.total_slots,
+        "cache_type_k": s.cache_type_k,
+        "cache_type_v": s.cache_type_v,
+        "cont_batching": s.cont_batching,
     }

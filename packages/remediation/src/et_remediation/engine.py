@@ -174,6 +174,10 @@ class RemediationManager:
         self._runs: dict[str, _NodeRun] = {}
         self.approvals: dict[str, ApprovalRequest] = {}
         self._approval_seq = 0
+        # Cap on retained RESOLVED approvals (pending are always kept). Stops the
+        # dict — and the O(n) pending scan in status() — from growing without
+        # bound on a box that hits a disruptive cause repeatedly over weeks.
+        self._approval_history_cap = 50
         # Trigger debounce: how many consecutive observes have seen this cause.
         self._debounce_rc: RootCause = RootCause.NONE
         self._debounce_count: int = 0
@@ -226,6 +230,7 @@ class RemediationManager:
         now = self._now_fn() if now is None else now
         nd = normalize(diagnosis, source)
         run = self._run(self.node_id)
+        self._prune_approvals()
 
         # 1) Resolve an in-flight verify FIRST — even if the kill-switch just
         #    flipped to OFF. A fix we already applied must always reach its
@@ -572,6 +577,18 @@ class RemediationManager:
     def pending_approvals(self) -> list[ApprovalRequest]:
         with self._lock:
             return [a for a in self.approvals.values() if a.status == "pending"]
+
+    def _prune_approvals(self) -> None:
+        """Keep all pending approvals + the most recent ``_approval_history_cap``
+        resolved ones; drop older resolved entries so the dict stays bounded over
+        a long run. Cheap: only sorts when the cap is actually exceeded."""
+        resolved = [(aid, ar) for aid, ar in self.approvals.items() if ar.status != "pending"]
+        excess = len(resolved) - self._approval_history_cap
+        if excess <= 0:
+            return
+        resolved.sort(key=lambda kv: kv[1].created_at)  # oldest first
+        for aid, _ in resolved[:excess]:
+            del self.approvals[aid]
 
     # -- helpers -------------------------------------------------------------
 

@@ -23,7 +23,7 @@ dev = ["pytest>=8", "ruff>=0.6"]
 et-remediation = "et_remediation.cli:main"
 
 [project.urls]
-Repository = "https://github.com/devan-p/ET"
+Repository = "https://github.com/Ronit-Devan/Fixer/tree/main/packages/remediation"
 
 [build-system]
 requires = ["hatchling"]

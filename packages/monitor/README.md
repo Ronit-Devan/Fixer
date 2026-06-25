@@ -62,6 +62,42 @@ request/KV-cache attribution.
 
 ---
 
+## The decode roofline: "40% of *what*?"
+
+`nvidia-smi` utilization is **not** throughput. On a single GPU serving one
+stream, decode is *memory-bandwidth bound* — utilization plateaus well below
+100% even when tokens/sec is already optimal. So "my GPU is at 40%" is ambiguous.
+
+Run detection once and the monitor answers it:
+
+```bash
+et-monitor --detect      # probes llama-server /props + the model GGUF + the GPU
+```
+
+That writes `~/.et/workload.json` (model size, layer count, GPU memory
+bandwidth); the monitor then computes, every tick:
+
+- **MBU** (memory-bandwidth utilization) and the **single-stream tok/s ceiling**,
+- **% of ceiling** you're actually hitting — the honest answer to "40% of what?",
+- **partial offload** — if `-ngl` left layers on the CPU (the #1 single-GPU
+  throughput bug), with a fix that's VRAM-fit-checked.
+
+It splits the old "decode-bound" verdict three ways instead of one:
+
+- **At the single-stream wall** (MBU near the limit): physics, not a bug — you
+  can't push util to 90% at concurrency 1. The lever is batching / speculative
+  decoding / a faster quant; chasing util% here is a vanity metric.
+- **Under-batched**: real concurrent demand is queueing — `--parallel N
+  --cont-batching`.
+- **Host-bound**: well below the bandwidth wall on a fully-offloaded model —
+  something host-side (threads, batch size, flash-attention off) is the limit.
+
+If your card isn't in the bandwidth table, pass `--gpu-bandwidth <GB/s>`. The
+monitor also **auto-detects on first run** when it can reach llama-server, so on
+a fresh box the roofline is usually on without any extra step. The dashboard
+shows a *throughput-vs-ceiling* panel (tok/s, MBU bar with the single-stream wall
+marked, % of ceiling, and the plain-language reason).
+
 ## Slack / webhook alerts
 
 Get pinged when the GPU needs attention; no need to watch the dashboard.
@@ -86,7 +122,8 @@ Get pinged when the GPU needs attention; no need to watch the dashboard.
 | Verdict | Meaning | What to do |
 |---|---|---|
 | **Idle (no requests)** | GPU sitting idle, no inference traffic | Quantify the cost; co-locate batch work; unload-on-idle |
-| **Decode bandwidth-bound** | Serving at low concurrency; util plateaus below 100% | Batch concurrent requests (`--parallel N`); speculative decoding |
+| **Model partly on CPU** | `-ngl` left layers on the CPU; throughput capped far below the card | Restart with `-ngl 999` (the monitor checks it fits in VRAM first) |
+| **Decode bandwidth-bound** | Serving below saturation; with a roofline, split into single-stream wall (physics) vs under-batched vs host-bound | Batch (`--parallel N --cont-batching`), speculative decoding, or fix the host-side limit — per the sub-reason |
 | **Memory under-used** | Lots of VRAM free while in use | Bigger/higher-precision model, larger context, more parallel slots |
 | **KV cache pressure** | Cache near full / requests deferred | Tune `--ctx-size`/`--parallel`; prefix caching; this is your scale-out signal |
 | **Throttling** | SM clock dragged down under load | Cooling/airflow; check power limit |
@@ -167,9 +204,14 @@ et-monitor --remediation-mode auto --remediation-audit-log ~/.et/remediation.jso
   killing only orphaned PIDs) auto-apply through a guarded path: apply → watch a
   bounded window for recovery → confirm or **auto-rollback**. The running
   `llama-server` / training job is **never** killed by this path.
-- **DISRUPTIVE fixes** (restart `llama-server` with tuned `-ngl`/`-t`/`-b`/cache
-  flags) **never** auto-fire — they appear as an approval card in the dashboard,
-  applied only after you approve (and a request-drain).
+- **DISRUPTIVE fixes** (restart `llama-server` with tuned flags) **never**
+  auto-fire — they appear as an approval card in the dashboard, applied only
+  after you approve (and a request-drain). The restart is **derived from the
+  roofline**: raise `-ngl` for partial offload (VRAM-fit-checked), raise
+  `--parallel`/`--cont-batching` only when there's real concurrent demand, and
+  recovery is judged on **tokens/sec** (not utilization, which single-stream
+  can't move). A box at the physical single-stream wall is left alone (no
+  pointless restart) and just explained.
 - A **circuit breaker** trips auto-apply to advise-only on repeated failure /
   flap / rate-cap breach.
 

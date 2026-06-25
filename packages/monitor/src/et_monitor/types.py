@@ -11,6 +11,7 @@ class Verdict(str, Enum):
     IDLE_NO_REQUESTS = "idle_no_requests"
     MEMORY_HEADROOM = "memory_headroom"
     DECODE_BANDWIDTH_BOUND = "decode_bandwidth_bound"
+    GPU_OFFLOAD_PARTIAL = "gpu_offload_partial"  # layers running on CPU (-ngl too low)
     KV_CACHE_PRESSURE = "kv_cache_pressure"
     THERMAL_THROTTLE = "thermal_throttle"
     VRAM_PRESSURE = "vram_pressure"  # VRAM climbing toward OOM (predictive)
@@ -23,6 +24,7 @@ VERDICT_TITLES: dict[Verdict, str] = {
     Verdict.IDLE_NO_REQUESTS: "Idle, no inference requests",
     Verdict.MEMORY_HEADROOM: "Memory under-used, room to do more",
     Verdict.DECODE_BANDWIDTH_BOUND: "Decode is memory-bandwidth bound",
+    Verdict.GPU_OFFLOAD_PARTIAL: "Model partly on CPU (raise -ngl)",
     Verdict.KV_CACHE_PRESSURE: "KV cache under pressure",
     Verdict.THERMAL_THROTTLE: "GPU is throttling",
     Verdict.VRAM_PRESSURE: "VRAM filling toward out-of-memory",
@@ -53,6 +55,15 @@ class Snapshot:
     # Derived live rates (computed from counter deltas in state.py)
     gen_tokens_per_s: float | None = None
     prompt_tokens_per_s: float | None = None
+    # Static llama-server runtime config (read once from /props; None if unknown).
+    # These describe HOW the server was launched, so the analyzer can attribute a
+    # bottleneck to a flag (small ctx, unquantized KV, no continuous batching) and
+    # the dashboard can show what the box is actually running.
+    ctx_size: int | None = None
+    total_slots: int | None = None
+    cache_type_k: str | None = None
+    cache_type_v: str | None = None
+    cont_batching: bool | None = None
 
     @property
     def mem_used_ratio(self) -> float | None:
