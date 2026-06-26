@@ -29,20 +29,34 @@ S=/workspace/llama.cpp/build/bin/llama-server
 echo "=== BUILD OK ==="
 
 echo "=== [2/3] benchmark (model downloads once, ~2GB) ==="
+wait_up(){ for _ in $(seq 1 300); do curl -fsS localhost:8080/props >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
+
+# Pre-warm: download + cache the model BEFORE timing anything, so the baseline
+# run never races the download (that left the first baseline with no reading).
+echo "-- prewarm: caching the model (one time) --"
+"$S" -hf "$HF" --host 127.0.0.1 --port 8080 --metrics -ngl 999 >/tmp/llama.log 2>&1 &
+PW=$!
+if ! wait_up; then echo "server failed to start; last log lines:"; tail -25 /tmp/llama.log; kill "$PW" 2>/dev/null; exit 1; fi
+kill "$PW" 2>/dev/null; sleep 3
+echo "   model ready."
+
 bench(){
   "$S" -hf "$HF" --host 127.0.0.1 --port 8080 --metrics "$@" >/tmp/llama.log 2>&1 &
-  P=$!
-  for _ in $(seq 1 240); do curl -fsS localhost:8080/props >/dev/null 2>&1 && break; sleep 2; done
+  local P=$!
+  wait_up || { kill "$P" 2>/dev/null; echo ""; return; }
   curl -fsS localhost:8080/completion \
-    -d "{\"prompt\":\"Explain in detail how GPUs work.\",\"n_predict\":$N,\"cache_prompt\":false,\"temperature\":0}" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["timings"]["predicted_per_second"])'
-  kill "$P" 2>/dev/null || true
-  sleep 3
+    -d "{\"prompt\":\"Explain in detail how GPUs work.\",\"n_predict\":$N,\"cache_prompt\":false,\"temperature\":0}" 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["timings"]["predicted_per_second"])' 2>/dev/null
+  kill "$P" 2>/dev/null; sleep 3
 }
 echo "-- baseline: partial offload (-ngl $NGL_PARTIAL, layers stuck on CPU) --"
-B=$(bench -ngl "$NGL_PARTIAL"); echo "baseline: $B tok/s"
+B=$(bench -ngl "$NGL_PARTIAL"); echo "baseline: ${B:-FAILED} tok/s"
 echo "-- fixed: full GPU offload (-ngl 999) --"
-F=$(bench -ngl 999); echo "fixed: $F tok/s"
+F=$(bench -ngl 999); echo "fixed: ${F:-FAILED} tok/s"
 
 echo "=== [3/3] RESULT ==="
-python3 -c "b=$B; f=$F; print(f'  baseline (partial offload): {b:.1f} tok/s'); print(f'  fixed (full GPU offload)  : {f:.1f} tok/s'); print(f'  >>> {f/b:.2f}x faster  (this is the optimization ET applies)')"
+if [ -n "$B" ] && [ -n "$F" ]; then
+  python3 -c "b=$B; f=$F; print(f'  baseline (partial offload): {b:.1f} tok/s'); print(f'  fixed (full GPU offload)  : {f:.1f} tok/s'); print(f'  >>> {f/b:.2f}x faster  (this is the optimization ET applies)')"
+else
+  echo "  baseline=${B:-FAILED}  fixed=${F:-FAILED}  — a run failed; see /tmp/llama.log"
+fi
