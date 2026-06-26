@@ -17,6 +17,7 @@ real safety gate that makes advise/dry-run incapable of touching the box.
 from __future__ import annotations
 
 import logging
+import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -62,7 +63,14 @@ class CommandRunner:
 
     @staticmethod
     def render(cmd: list[str]) -> str:
-        return " ".join(cmd)
+        """Render argv as a copy-pasteable shell string.
+
+        Execution always passes the argv *list* to subprocess (shell=False), so a
+        path with spaces runs correctly regardless; this is purely the human-facing
+        preview/audit string, which an operator may paste into a shell — so quote
+        each token (e.g. a draft model path with spaces) to keep it faithful.
+        """
+        return " ".join(shlex.quote(part) for part in cmd)
 
     def run(self, cmd: list[str]) -> RunResult:
         rendered = self.render(cmd)

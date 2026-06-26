@@ -33,8 +33,19 @@ _FLAG_MAP: dict[str, str] = {
     "parallel": "--parallel",
     "cache_type_k": "--cache-type-k",
     "cache_type_v": "--cache-type-v",
-    "model_draft": "--model-draft",  # speculative decoding draft model
-    "draft": "--draft",
+    "model_draft": "--model-draft",  # speculative decoding draft model (-md)
+    # How many DRAFT-model layers go on the GPU. WITHOUT this the draft model
+    # runs on the CPU, which serialises every draft step and negates the entire
+    # speculative-decoding speedup on a GPU box. Short form -ngld is stable across
+    # the llama.cpp builds that support speculative decoding.
+    "n_gpu_layers_draft": "-ngld",
+    "draft": "--draft",  # draft tokens per step (alias of --draft-max on most builds)
+    # Acceptance-tuning knobs for speculative decoding. Only rendered when the
+    # operator sets them (they default to unset), so behaviour is unchanged by
+    # default and the operator opts in with names matching their llama.cpp build.
+    "draft_min": "--draft-min",
+    "draft_p_min": "--draft-p-min",
+    "threads_batch": "--threads-batch",  # prefill thread count (host-bound case)
 }
 
 # Boolean (presence-only) flags: included when the param is truthy.
@@ -42,8 +53,23 @@ _BOOL_FLAG_MAP: dict[str, str] = {
     "mlock": "--mlock",
     "no_mmap": "--no-mmap",
     "cont_batching": "--cont-batching",
+}
+
+# Flags that take an explicit on/off-style argument in current llama.cpp. A bare
+# presence flag is WRONG for these on recent builds (e.g. ``-fa, --flash-attn
+# [on|off|auto]`` consumes an argument), so we always render the value.
+_VALUE_BOOL_FLAG_MAP: dict[str, str] = {
     "flash_attn": "--flash-attn",
 }
+
+
+def _onoff(value: object) -> str:
+    """Normalise a flag value to llama.cpp's on/off/auto vocabulary."""
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
 
 
 class LlamaCppActuator(Actuator):
@@ -86,6 +112,10 @@ class LlamaCppActuator(Actuator):
         for key, flag in _BOOL_FLAG_MAP.items():
             if p.get(key):
                 argv += [flag]
+        # Value-bearing on/off flags (current llama.cpp requires the argument).
+        for key, flag in _VALUE_BOOL_FLAG_MAP.items():
+            if key in p and p[key] is not None:
+                argv += [flag, _onoff(p[key])]
         return argv
 
     # -- drain ---------------------------------------------------------------

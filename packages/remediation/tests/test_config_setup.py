@@ -95,6 +95,29 @@ def test_setup_wizard_captures_llama_knobs(tmp_path):
     assert cfg.knobs["restart_command"] == ["systemctl", "restart", "llama"]
 
 
+def test_setup_wizard_captures_draft_model_for_spec_decode(tmp_path):
+    # The draft-model knob is what makes the speculative-decoding fix reachable
+    # in production (the box-at-the-wall lever). Without it, that path is dead.
+    answers = iter([
+        "2",                  # mode -> advise
+        "",                   # no protected pids
+        "",                   # no label
+        "y",                  # configure llama tuning
+        "/models/main.gguf",  # model path
+        "",                   # no layer count
+        "",                   # no restart command
+        "/models/draft.gguf", # draft model
+        "24",                 # draft tokens per step
+    ])
+    cfg = run_setup(
+        input_fn=lambda prompt: next(answers, ""),
+        print_fn=lambda s: None,
+        path=tmp_path / "r.json",
+    )
+    assert cfg.knobs["draft_model"] == "/models/draft.gguf"
+    assert cfg.knobs["draft_n"] == 24
+
+
 def test_setup_wizard_defaults_to_advise_on_empty(tmp_path):
     answers = iter(["", "", ""])  # accept defaults
     cfg = run_setup(

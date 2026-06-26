@@ -173,6 +173,87 @@ def _build_restart_llama(ctx: ActionContext) -> dict:
 
     if k.get("mlock", True):
         params["mlock"] = True
+
+    # Flash attention: smaller KV footprint per token and a prerequisite for the
+    # KV-cache quantization set above (q8_0 K/V needs flash-attn). Rendered with an
+    # explicit value because current llama.cpp's -fa flag takes [on|off|auto].
+    # Default ON unless the operator explicitly disabled it.
+    fa = k.get("flash_attn", True)
+    if fa is not False:
+        params["flash_attn"] = "on" if fa is True else fa
+
+    # Micro-batch size primarily speeds up PREFILL (prompt ingestion), not
+    # single-stream decode, and a larger ubatch grows the compute buffers (more
+    # VRAM). So only raise it when there is clear VRAM headroom; otherwise leave
+    # llama.cpp's default. This keeps the restart from OOMing a near-full card.
+    ubatch = k.get("ubatch_size")
+    if ubatch is not None:
+        params["ubatch_size"] = int(ubatch)
+    elif mem_ratio is not None and mem_ratio < 0.80:
+        params["ubatch_size"] = 1024
+
+    return params
+
+
+def _build_spec_decode(ctx: ActionContext) -> dict:
+    """Enable speculative decoding. Raises (advise-only fallback) when it can't help.
+
+    Spec decode runs a small draft model to propose N tokens, then verifies them
+    in one forward pass of the main model. On a bandwidth-bound single-stream box
+    at the physical decode ceiling this is the primary lever for pushing tok/s
+    higher: the verification pass amortises the weight read across N tokens. The
+    realised speedup is acceptance-rate dependent (typically ~1.3-2x for a
+    well-matched draft of the same model family), NOT guaranteed — which is why
+    the restart is verified on actual tok/s and rolled back if it doesn't help.
+
+    Refuses (so the engine falls through to advise) when:
+      * no ``draft_model`` is configured — nothing to draft with;
+      * VRAM is already near full — the draft model AND its own KV cache need
+        room, and a box at the single-stream wall already has the main model
+        fully resident; loading a second model would OOM on reload.
+    """
+    m = ctx.metrics
+    k = ctx.knobs
+    draft_model = k.get("draft_model") or k.get("model_draft")
+    if not draft_model:
+        raise KeyError(
+            "no draft_model configured; set draft_model knob to the path of a small "
+            "GGUF (e.g. a 0.5-3B quant of the same family) to enable speculative decoding"
+        )
+    # A draft model needs its own VRAM (weights + KV). Don't add it to a full card.
+    mem_ratio = m.get("mem_used_ratio")
+    if mem_ratio is not None and mem_ratio >= 0.85:
+        raise ValueError(
+            "VRAM near full; loading a draft model would risk OOM. Free VRAM (smaller "
+            "main quant / KV quant) before enabling speculative decoding."
+        )
+    draft_n = int(k.get("draft_n", k.get("draft", 16)))
+    if draft_n < 1:
+        # --draft 0 / negative is a nonsensical speculative-decode config; refuse
+        # so the engine advises rather than launching a server with a bad flag.
+        raise ValueError(f"draft token count must be >= 1, got {draft_n}")
+    # Offload the draft model to the GPU too. Without -ngld the draft runs on the
+    # CPU and serialises every draft step, which negates the whole speedup. A small
+    # draft model has few layers, so "all on GPU" (999) is safe and correct.
+    draft_ngl = int(k.get("draft_n_gpu_layers", 999))
+    params: dict = {
+        "model": k.get("model"),
+        "restart_command": k.get("restart_command"),
+        "prior_argv": k.get("prior_argv", []),
+        "model_draft": str(draft_model),
+        "n_gpu_layers_draft": draft_ngl,
+        "draft": draft_n,
+        # Flash attention (on) cuts KV bandwidth on the verifier pass so it costs
+        # less per N-token batch; rendered with an explicit on/off value.
+        "flash_attn": "on",
+        "mlock": k.get("mlock", True),
+        "drain_timeout_s": k.get("drain_timeout_s", 30.0),
+    }
+    # Optional, VRAM-free acceptance-tuning knobs — passed through only when the
+    # operator set them (flag names match their llama.cpp build).
+    for knob in ("draft_min", "draft_p_min"):
+        if k.get(knob) is not None:
+            params[knob] = k[knob]
     return params
 
 
@@ -298,6 +379,21 @@ PARTIAL_GPU_OFFLOAD = ActionSpec(
     requires_drain=True,
 )
 
+SPEC_DECODE_AT_CEILING = ActionSpec(
+    root_cause=RootCause.AT_PRACTICAL_CEILING,
+    kind=ActionKind.RESTART_LLAMA_SERVER,
+    action_class=ActionClass.DISRUPTIVE,
+    reversible=True,
+    summary=(
+        "Enable speculative decoding (--model-draft / --draft) to push past the "
+        "single-stream memory-bandwidth wall. Requires a draft_model knob; falls "
+        "back to advise-only when none is configured."
+    ),
+    build_params=_build_spec_decode,
+    recovered=throughput_recovered,
+    requires_drain=True,
+)
+
 
 ALL_STRATEGIES: list[ActionSpec] = [
     THERMAL_POWER_THROTTLE,
@@ -308,6 +404,7 @@ ALL_STRATEGIES: list[ActionSpec] = [
     DISTRIBUTED_COMM_STALL,
     SUBOPTIMAL_RUNTIME_FLAGS,
     PARTIAL_GPU_OFFLOAD,
+    SPEC_DECODE_AT_CEILING,
 ]
 
 

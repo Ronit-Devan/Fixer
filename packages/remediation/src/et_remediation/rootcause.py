@@ -36,11 +36,12 @@ class RootCause(str, Enum):
     # model on the GPU. Disruptive (a restart), so always approval-gated.
     PARTIAL_GPU_OFFLOAD = "partial_gpu_offload"
 
-    # --- nothing to remediate (advise-only terminal) ---
-    # The box is at the physical single-stream memory-bandwidth wall. Restarting
-    # with different flags will NOT raise tokens/sec — the honest move is to
-    # explain (batching / spec-decode / quant) and take no action. No strategy is
-    # registered for this cause, so the engine advises and never opens a restart.
+    # --- conditionally remediable (spec decode when draft model is available) ---
+    # The box is at the physical single-stream memory-bandwidth wall. A plain flag
+    # restart will NOT raise tokens/sec — but speculative decoding can push past
+    # it by verifying N draft tokens in one forward pass (amortising weight reads).
+    # The SPEC_DECODE_AT_CEILING strategy handles this: it applies when a
+    # ``draft_model`` knob is configured and falls back to advise-only when not.
     AT_PRACTICAL_CEILING = "at_practical_ceiling"
     NONE = "none"
 

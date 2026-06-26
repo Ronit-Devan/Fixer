@@ -438,8 +438,9 @@ def analyze(
                 fix,
                 "Partial CPU offload is usually the single biggest throughput loss on "
                 "a one-GPU box; fixing -ngl often multiplies tokens/sec.",
-                "After the restart, ET verifies tokens/sec actually recovered and rolls "
-                "back automatically if it didn't.",
+                "A restart is disruptive, so ET only applies it with your approval. After "
+                "it comes back, ET measures whether tokens/sec actually improved and shows "
+                "you — if it didn't, revert to the prior flags.",
             ],
             metrics,
         )

@@ -94,6 +94,19 @@ def run_setup(
         restart = input_fn("  Command to relaunch llama-server []: ").strip()
         if restart:
             cfg.knobs["restart_command"] = restart.split()
+        # Optional draft model: enables speculative decoding when the box is at the
+        # single-stream bandwidth wall (the only lever that pushes tok/s past it).
+        draft = input_fn(
+            "  Draft .gguf for speculative decoding (small same-family quant) []: "
+        ).strip()
+        if draft:
+            cfg.knobs["draft_model"] = draft
+            dn = input_fn("    Draft tokens per step [16]: ").strip()
+            if dn:
+                try:
+                    cfg.knobs["draft_n"] = int(dn)
+                except ValueError:
+                    pass
 
     cfg.configured = True
     save_path = Path(path) if path else default_config_path()
