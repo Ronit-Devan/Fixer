@@ -20,6 +20,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 from et_monitor.analyzer import Thresholds, analyze
 from et_monitor.gpu import GpuSampler
@@ -225,7 +226,7 @@ class Monitor:
             last_tick = tick_start
             try:
                 self.tick(dt=dt)
-            except Exception:  # noqa: BLE001; the loop must never die
+            except Exception:  # noqa: BLE001 — the loop must never die
                 log.exception("monitor tick failed")
             elapsed = time.time() - tick_start
             self._record_tick_cost(elapsed)
@@ -361,7 +362,9 @@ class Monitor:
             self._prev_llama = lm
 
         if not readings:
-            readings = [None]  # synthesize a "(no GPU)" track so the loop still runs
+            # synthesize a "(no GPU)" track so the loop still runs; the per-GPU
+            # body below handles the None sentinel (mypy can't see the widening).
+            readings = [None]  # type: ignore[list-item]
 
         primary_snap: Snapshot | None = None
         for gr in readings:
@@ -435,7 +438,7 @@ class Monitor:
         with self._lock:
             return sorted(self._tracks)
 
-    def remediation_managers(self) -> dict[int, object]:
+    def remediation_managers(self) -> dict[int, Any]:
         """All active remediation managers keyed by GPU index (for the API).
 
         Includes factory-built per-GPU managers, plus the single back-compat

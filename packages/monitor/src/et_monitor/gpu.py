@@ -153,7 +153,7 @@ class NvmlGpuSampler(GpuSampler):
         def _try(fn, default=None):
             try:
                 return fn()
-            except Exception:  # noqa: BLE001; any NVML hiccup degrades to None
+            except Exception:  # noqa: BLE001 — any NVML hiccup degrades to None
                 return default
 
         name = _try(lambda: _decode(nv.nvmlDeviceGetName(h)), f"GPU {index}")
@@ -215,9 +215,10 @@ class NvidiaSmiGpuSampler(GpuSampler):
     backend = "nvidia-smi"
 
     def __init__(self, indices: Sequence[int] | None = None) -> None:
-        self._smi = shutil.which("nvidia-smi")
-        if not self._smi:
+        smi = shutil.which("nvidia-smi")
+        if not smi:
             raise RuntimeError("nvidia-smi not found on PATH")
+        self._smi: str = smi
         self._indices = set(indices) if indices is not None else None
         # One validating read at construction; cache the GPU count from it so
         # gpu_count() never spawns another subprocess (the physical GPU count

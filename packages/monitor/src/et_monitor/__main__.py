@@ -20,6 +20,7 @@ from pathlib import Path
 from et_monitor.alerts import (
     AlertConfig,
     AlertManager,
+    Notifier,
     SlackNotifier,
     WebhookNotifier,
 )
@@ -33,7 +34,7 @@ from et_monitor.state import Monitor, MonitorConfig
 
 
 def _build_alert_manager(args: argparse.Namespace) -> AlertManager | None:
-    notifiers = []
+    notifiers: list[Notifier] = []
     if args.slack_webhook:
         notifiers.append(SlackNotifier(args.slack_webhook))
     if args.webhook:
@@ -401,10 +402,12 @@ def main() -> None:
     print(f"\n  ET monitor -> {url}")
     print("  (Ctrl-C to stop)\n")
     if not args.no_browser:
-        threading.Thread(
-            target=lambda: (time.sleep(1.2), webbrowser.open(url)),
-            daemon=True,
-        ).start()
+
+        def _open_browser() -> None:
+            time.sleep(1.2)
+            webbrowser.open(url)
+
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
