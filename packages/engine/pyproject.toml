@@ -9,8 +9,6 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pydantic>=2.13.4",
     "rich>=15.0.0",
     "typer>=0.25.1",
 ]
@@ -27,8 +25,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/devan-p/ET"
-Issues = "https://github.com/devan-p/ET/issues"
+Repository = "https://github.com/Ronit-Devan/Fixer/tree/main/packages/engine"
+Issues = "https://github.com/Ronit-Devan/Fixer/issues"
 
 [project.scripts]
 gpu-doctor = "gpu_doctor_engine.cli:app"

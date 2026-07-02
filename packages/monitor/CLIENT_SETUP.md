@@ -56,7 +56,13 @@ network and use the box's LAN IP:
 ```
 
 Then browse to `http://<gpu-box-ip>:7070` from any machine on the same network.
-(Only do this on a trusted network; there's no auth on the dashboard.)
+
+> **Security note:** the dashboard has **no authentication**. Binding to
+> `0.0.0.0` exposes every endpoint to the network — including, if the
+> remediation layer is enabled, the mode kill-switch and the **approve** button
+> for disruptive fixes (anyone on the LAN could approve a llama-server
+> restart). Only bind beyond `127.0.0.1` on a trusted, isolated network, or
+> put it behind a reverse proxy with auth.
 
 ---
 

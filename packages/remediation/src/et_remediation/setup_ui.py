@@ -9,6 +9,7 @@ so the wizard is unit-testable without a TTY.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Callable
 
@@ -51,39 +52,66 @@ def run_setup(
     cfg = existing or RemediationConfig()
     print_fn(_INTRO)
 
-    choice = (input_fn("Mode [2]: ") or "2").strip()
+    # A headless/piped invocation (systemd, `< /dev/null`, closed-stdin SSH)
+    # raises EOFError from input(); every prompt treats that as "accept the
+    # default" so setup completes with the safe ADVISE config instead of dying
+    # with a traceback and never saving anything.
+    eof_seen = False
+
+    def ask(prompt: str) -> str:
+        nonlocal eof_seen
+        try:
+            return input_fn(prompt)
+        except EOFError:
+            if not eof_seen:
+                eof_seen = True
+                print_fn("(no interactive input available; accepting defaults)")
+            return ""
+
+    choice = (ask("Mode [2]: ") or "2").strip()
     cfg.mode = _MODE_CHOICES.get(choice, RemediationMode.ADVISE)
 
-    pids_raw = input_fn(
+    pids_raw = ask(
         "Protected workload PID(s), comma-separated (the live task to never touch) []: "
     ).strip()
     if pids_raw:
-        cfg.protected_pids = [int(p) for p in pids_raw.replace(",", " ").split() if p.strip()]
-    label = input_fn("Protected workload label (e.g. pod/job name) []: ").strip()
+        try:
+            cfg.protected_pids = [
+                int(p) for p in pids_raw.replace(",", " ").split() if p.strip()
+            ]
+        except ValueError:
+            print_fn(f"  (couldn't parse {pids_raw!r} as PIDs; protected PIDs left unset)")
+    label = ask("Protected workload label (e.g. pod/job name) []: ").strip()
     if label:
         cfg.protected_label = label
 
     if cfg.mode is RemediationMode.AUTO:
-        rate = input_fn(
+        rate = ask(
             f"Max auto-applies per {int(cfg.caps.window_s)}s window [{cfg.caps.max_actions_per_window}]: "
         ).strip()
         if rate:
-            cfg.caps.max_actions_per_window = int(rate)
-        win = input_fn(f"Verify window seconds [{int(cfg.verify_window_s)}]: ").strip()
+            try:
+                cfg.caps.max_actions_per_window = int(rate)
+            except ValueError:
+                print_fn(f"  (not a number: {rate!r}; keeping {cfg.caps.max_actions_per_window})")
+        win = ask(f"Verify window seconds [{int(cfg.verify_window_s)}]: ").strip()
         if win:
-            cfg.verify_window_s = float(win)
+            try:
+                cfg.verify_window_s = float(win)
+            except ValueError:
+                print_fn(f"  (not a number: {win!r}; keeping {int(cfg.verify_window_s)})")
 
     # llama.cpp tuning knobs: what a RESTART_LLAMA_SERVER fix needs to actually
     # relaunch the server (raise -ngl, add slots). Optional — the strategies have
     # safe defaults (-ngl 999, demand-gated --parallel) when these are absent.
-    ask = input_fn(
+    want_llama = ask(
         "Configure llama.cpp tuning for auto-fixes (model / layers / restart cmd)? [y/N]: "
     ).strip().lower()
-    if ask.startswith("y"):
-        model = input_fn("  Model .gguf path []: ").strip()
+    if want_llama.startswith("y"):
+        model = ask("  Model .gguf path []: ").strip()
         if model:
             cfg.knobs["model"] = model
-        layers = input_fn(
+        layers = ask(
             "  Model layer count (enables '-ngl all' on partial offload) []: "
         ).strip()
         if layers:
@@ -91,17 +119,27 @@ def run_setup(
                 cfg.knobs["model_n_layers"] = int(layers)
             except ValueError:
                 pass
-        restart = input_fn("  Command to relaunch llama-server []: ").strip()
+        restart = ask("  Command to relaunch llama-server []: ").strip()
         if restart:
-            cfg.knobs["restart_command"] = restart.split()
+            # Quote-aware split so a model path with spaces survives ("-m
+            # '/models/my model.gguf'"). Unquoted commands keep the plain
+            # whitespace split (identical to prior behaviour, and safe for
+            # Windows backslash paths, which shlex would mangle).
+            if '"' in restart or "'" in restart:
+                try:
+                    cfg.knobs["restart_command"] = shlex.split(restart)
+                except ValueError:
+                    cfg.knobs["restart_command"] = restart.split()
+            else:
+                cfg.knobs["restart_command"] = restart.split()
         # Optional draft model: enables speculative decoding when the box is at the
         # single-stream bandwidth wall (the only lever that pushes tok/s past it).
-        draft = input_fn(
+        draft = ask(
             "  Draft .gguf for speculative decoding (small same-family quant) []: "
         ).strip()
         if draft:
             cfg.knobs["draft_model"] = draft
-            dn = input_fn("    Draft tokens per step [16]: ").strip()
+            dn = ask("    Draft tokens per step [16]: ").strip()
             if dn:
                 try:
                     cfg.knobs["draft_n"] = int(dn)

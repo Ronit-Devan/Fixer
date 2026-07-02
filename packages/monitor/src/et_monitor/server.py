@@ -7,6 +7,7 @@ launcher so tests can drive the API against a demo-backed monitor.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException
@@ -19,17 +20,21 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def create_app(monitor: Monitor, *, start: bool = True) -> FastAPI:
-    app = FastAPI(title="ET; GPU idleness monitor", docs_url="/api/docs")
-
+    # Lifespan (not the deprecated @app.on_event hooks, which a future
+    # FastAPI/Starlette may drop — silently leaving the monitor thread never
+    # started): start sampling when the server comes up, stop it on shutdown.
+    lifespan = None
     if start:
 
-        @app.on_event("startup")
-        def _startup() -> None:
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
             monitor.start()
+            try:
+                yield
+            finally:
+                monitor.stop()
 
-        @app.on_event("shutdown")
-        def _shutdown() -> None:
-            monitor.stop()
+    app = FastAPI(title="ET; GPU idleness monitor", docs_url="/api/docs", lifespan=lifespan)
 
     @app.get("/api/snapshot")
     def snapshot() -> JSONResponse:

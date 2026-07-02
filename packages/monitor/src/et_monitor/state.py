@@ -63,6 +63,24 @@ class MonitorConfig:
     def __post_init__(self) -> None:
         if self.thresholds is None:
             self.thresholds = Thresholds()
+        # A zero interval divides by zero sizing the history buffer and busy-loops
+        # the sampler; a negative one busy-loops silently. Reject both up front
+        # (the agent package enforces the identical invariant on its interval).
+        if self.interval_s <= 0:
+            raise ValueError(f"interval_s must be > 0, got {self.interval_s}")
+        # A slow sample rate must not starve the verdict window below the
+        # analyzer's min_samples (3), or diagnosis is permanently UNKNOWN. Grow
+        # the window just enough to hold min_samples+1 readings; the default
+        # 1s/30s configuration is untouched.
+        min_window = self.interval_s * (self.thresholds.min_samples + 1)
+        if self.window_seconds < min_window:
+            grown = int(-(-min_window // 1))  # ceil without importing math
+            log.warning(
+                "interval_s=%.1fs cannot fill the %ds verdict window with %d samples; "
+                "growing window_seconds to %ds so diagnosis stays functional.",
+                self.interval_s, self.window_seconds, self.thresholds.min_samples, grown,
+            )
+            self.window_seconds = grown
         # Keep the back-off ceiling from starving the diagnosis window of the
         # minimum samples it needs (min_samples=3): never let the interval grow
         # so large that the trailing window can't hold a few readings.

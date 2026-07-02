@@ -56,7 +56,11 @@ async def analyze(file: UploadFile = File(...)) -> dict:
             detail="File must be a .json or .json.gz PyTorch Profiler trace",
         )
 
-    raw = await file.read()
+    # Bounded read: never materialize more than the cap + 1 byte in memory, so a
+    # multi-GB upload is rejected without a RAM spike. A read that comes back
+    # over the cap proves the file is too large; at or under it, EOF was hit and
+    # we hold the complete body.
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,

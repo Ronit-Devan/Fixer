@@ -33,6 +33,17 @@ from et_monitor.server import create_app
 from et_monitor.state import Monitor, MonitorConfig
 
 
+def _positive_float(raw: str) -> float:
+    """argparse type for flags that must be a positive number (e.g. --interval)."""
+    try:
+        v = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {raw}")
+    return v
+
+
 def _build_alert_manager(args: argparse.Namespace) -> AlertManager | None:
     notifiers: list[Notifier] = []
     if args.slack_webhook:
@@ -263,7 +274,12 @@ def main() -> None:
         default=0.0,
         help="GPU cost in $/hour, to estimate dollars wasted on idle. 0 = off.",
     )
-    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument(
+        "--interval",
+        type=_positive_float,
+        default=1.0,
+        help="Seconds between GPU samples (must be > 0; default 1).",
+    )
     parser.add_argument(
         "--mock", action="store_true", help="Force mock GPU data (no NVIDIA card)."
     )

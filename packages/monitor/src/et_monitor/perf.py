@@ -59,6 +59,17 @@ _BANDWIDTH_GB_S: dict[str, float] = {
     "4070": 504.0,
     "3090": 936.0,
     "3080": 760.0,
+    # Ampere/Turing workstation cards. These MUST be listed explicitly: without
+    # them, longest-substring matching lets "RTX A4000" hit the "a40" key
+    # (696 GB/s vs the A4000's real 448) and "T400" hit "t4" (320 vs ~80) —
+    # silently wrong ceilings. Listing the full names wins by length.
+    "a4000": 448.0,
+    "a4500": 640.0,
+    "a5000": 768.0,
+    "a2000": 288.0,
+    "t400": 80.0,
+    "t600": 160.0,
+    "t1000": 160.0,
     "a6000": 768.0,
     "6000 ada": 960.0,
     "rtx 6000 ada": 960.0,

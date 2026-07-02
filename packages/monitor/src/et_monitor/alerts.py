@@ -176,10 +176,13 @@ class AlertManager:
 
         if alerting:
             # New episode if we weren't alerting, or the verdict changed to a
-            # different alert-worthy verdict. Respect per-verdict cooldown.
+            # different alert-worthy verdict. The per-verdict cooldown applies
+            # unconditionally: a first-time escalation (no prior send) passes it
+            # trivially, while metrics oscillating between two alert-worthy
+            # verdicts can't bypass it and spam a message every flip.
             if self._active_alert != d.verdict:
                 last = self._last_sent_at.get(d.verdict, float("-inf"))
-                if now_s - last >= self.cfg.cooldown_s or self._active_alert is not None:
+                if now_s - last >= self.cfg.cooldown_s:
                     payload = AlertPayload(
                         kind="alert",
                         diagnosis=d,
