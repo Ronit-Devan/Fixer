@@ -81,9 +81,11 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
 
 ## Phase status
 
-- [ ] **Phase 1.1** — Fix bandwidth table: add SFF keys (RTX PRO 4000 Blackwell SFF =
-      432) winning longest-substring over 672; audit all Blackwell workstation SKUs;
-      regression tests with real NVML name strings + SFF-vs-non-SFF disambiguation.
+- [x] **Phase 1.1** — DONE. `perf.py` `_BANDWIDTH_GB_S`: added `pro 4000 blackwell sff`
+      =432 (wins longest-substring over full `pro 4000 blackwell`=672) and
+      `pro 2000 blackwell`=288. Verified vs NVIDIA pages: 6000=1792, 5000=1344, 4500=896,
+      4000-full=672, 4000-SFF=432, 2000=288. Fixed the test that hard-coded SFF==672;
+      added disambiguation + lineup tests. `tests/test_perf.py`+`test_detect.py` green (18).
 - [ ] **Phase 1.2** — MoE-aware roofline: read expert_count/expert_used_count from GGUF;
       compute active-params bytes/token for MoE decode ceiling; keep never-raises
       contract; tests for dense (unchanged), MoE, missing-metadata fallback.

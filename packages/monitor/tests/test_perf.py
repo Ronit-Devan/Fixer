@@ -16,12 +16,31 @@ from et_monitor.perf import (
 
 
 def test_bandwidth_longest_substring_wins():
-    # "rtx pro 4000 blackwell" must beat the generic "blackwell" fallback.
-    bw = bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF")
-    assert bw == 672.0
     assert bandwidth_for("Tesla H100 PCIe") == 3350.0
     assert bandwidth_for("Some Unknown Card 9000") is None
     assert bandwidth_for(None) is None
+
+
+def test_bandwidth_sff_disambiguated_from_full_blackwell():
+    # The SFF trap: the 70 W SFF downclocks its GDDR7 to 432 GB/s, while the full
+    # 140 W card is 672. The SFF NVML name contains "pro 4000 blackwell", so the
+    # longer "pro 4000 blackwell sff" key MUST win — otherwise the SFF silently
+    # inherits the full card's 672 and the roofline ceiling is ~1.55x too high.
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF Edition") == 432.0
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF") == 432.0
+    # The full (non-SFF) card is unaffected and stays 672.
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell") == 672.0
+
+
+def test_bandwidth_blackwell_workstation_lineup():
+    # Every workstation Blackwell SKU resolves to its own verified bandwidth
+    # rather than the generic "blackwell" fallback.
+    assert bandwidth_for("NVIDIA RTX PRO 6000 Blackwell Workstation Edition") == 1792.0
+    assert bandwidth_for("NVIDIA RTX PRO 5000 Blackwell") == 1344.0
+    assert bandwidth_for("NVIDIA RTX PRO 4500 Blackwell") == 896.0
+    assert bandwidth_for("NVIDIA RTX PRO 2000 Blackwell") == 288.0
+    # An unrecognized Blackwell SKU still gets the generic fallback (not None).
+    assert bandwidth_for("NVIDIA RTX PRO 9999 Blackwell") == 672.0
 
 
 # -- GGUF reader -------------------------------------------------------------

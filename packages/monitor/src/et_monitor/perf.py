@@ -77,11 +77,24 @@ _BANDWIDTH_GB_S: dict[str, float] = {
     "4500 ada": 432.0,
     "4000 ada": 360.0,
     "2000 ada": 288.0,
-    # Blackwell workstation (RTX PRO ... Blackwell) — approx, refine at setup
+    # Blackwell workstation (RTX PRO ... Blackwell). Verified against NVIDIA
+    # product pages / datasheets (Jul 2026).
+    #
+    # THE SFF TRAP: the RTX PRO 4000 Blackwell *SFF Edition* has the SAME 24 GB /
+    # 192-bit GDDR7 as the full card but clocks the memory slower to fit a 70 W
+    # envelope (vs 140 W), so it is 432 GB/s, NOT the full card's 672 (verified:
+    # nvidia.com .../rtx-pro-4000-sff/ lists 432 GB/s). Its NVML name
+    # ("NVIDIA RTX PRO 4000 Blackwell SFF Edition") CONTAINS "pro 4000 blackwell",
+    # so without the explicit longer SFF key below it silently inherits 672 — a
+    # ~1.55x too-high ceiling that mislabels a card at its wall as "fixable".
+    # Longest-substring matching makes the SFF key win. Same care for the 2000:
+    # without its own key it would fall through to the generic "blackwell": 672.
     "rtx pro 6000 blackwell": 1792.0,
     "pro 5000 blackwell": 1344.0,
     "pro 4500 blackwell": 896.0,
-    "pro 4000 blackwell": 672.0,
+    "pro 4000 blackwell sff": 432.0,  # 70 W SFF: downclocked GDDR7 (verified NVIDIA spec)
+    "pro 4000 blackwell": 672.0,      # full 140 W card
+    "pro 2000 blackwell": 288.0,      # 16 GB, 128-bit GDDR7
     "blackwell": 672.0,  # generic fallback for an unrecognized Blackwell SKU
 }
 
