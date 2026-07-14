@@ -18,9 +18,14 @@ from et_remediation import (
 from et_remediation.actions import ActionContext, ActionKind, ActionRequest, ProtectedWorkload
 from et_remediation.actuators.base import CommandRunner
 from et_remediation.rootcause import RootCause, map_monitor_verdict
-from et_remediation.strategies import _build_fix_offload, _build_restart_llama, _build_spec_decode
+from et_remediation.strategies import (
+    _build_fix_offload,
+    _build_prefill_cache,
+    _build_restart_llama,
+    _build_spec_decode,
+)
 from et_remediation.telemetry import summarize
-from et_remediation.verify import throughput_recovered
+from et_remediation.verify import prefill_relieved, throughput_recovered
 
 
 def _ctx(metrics=None, knobs=None) -> ActionContext:
@@ -330,3 +335,92 @@ def test_actuator_renders_spec_decode_with_draft_gpu_layers():
     assert "--draft 16" in s
     assert "-ngld 999" in s  # draft model offloaded to GPU, not stranded on CPU
     assert "--flash-attn on" in s
+
+
+# -- KV-cache quantization is opt-in (quality policy) ------------------------
+
+
+def test_kv_quant_is_opt_in_not_default():
+    # Output-altering, so the default tune must NOT quantize the KV cache.
+    p = _build_restart_llama(_ctx())
+    assert "cache_type_k" not in p and "cache_type_v" not in p
+    # Opt-in via the allow_kv_quant knob...
+    p2 = _build_restart_llama(_ctx(knobs={"allow_kv_quant": True}))
+    assert p2["cache_type_k"] == "q8_0" and p2["cache_type_v"] == "q8_0"
+    # ...but never re-quantizes an already-quantized cache.
+    p3 = _build_restart_llama(
+        _ctx(knobs={"allow_kv_quant": True, "current_cache_type_k": "q8_0"})
+    )
+    assert "cache_type_k" not in p3
+
+
+# -- prefill-bound -> prefix caching (the client's bottleneck) ---------------
+
+
+def test_prefill_bound_maps_to_cold_prefix_cache():
+    assert map_monitor_verdict("prefill_bound") is RootCause.COLD_PREFIX_CACHE
+
+
+def test_prefill_cache_builder_is_lossless_and_sets_cache_reuse():
+    p = _build_prefill_cache(
+        _ctx(metrics={"mem_used_ratio": 0.6}, knobs={"model": "m.gguf", "model_n_layers": 48})
+    )
+    assert p["cache_reuse"] == 256
+    assert p["n_gpu_layers"] == 48
+    assert p["flash_attn"] == "on"
+    # Output-lossless: no KV quantization, no model/quant change.
+    assert "cache_type_k" not in p and "cache_type_v" not in p
+
+
+def test_prefill_cache_builder_respects_knobs_and_headroom():
+    p = _build_prefill_cache(_ctx(metrics={"mem_used_ratio": 0.5}, knobs={"cache_reuse": 512}))
+    assert p["cache_reuse"] == 512
+    assert p["ubatch_size"] == 2048  # VRAM headroom -> speed the cold prefills
+    # No headroom -> leave llama.cpp's default ubatch.
+    assert "ubatch_size" not in _build_prefill_cache(_ctx(metrics={"mem_used_ratio": 0.9}))
+
+
+def test_prefill_cache_no_ngl_growth_when_vram_full():
+    p = _build_prefill_cache(_ctx(metrics={"mem_used_ratio": 0.95}, knobs={"n_gpu_layers": 20}))
+    assert p["n_gpu_layers"] == 20  # held; not pushed to full into a near-full card
+
+
+def test_actuator_renders_cache_reuse():
+    act = LlamaCppActuator(CommandRunner(execute=False))
+    req = ActionRequest(
+        kind=ActionKind.RESTART_LLAMA_SERVER, action_class=None, node_id="n", target="0",
+        params={"model": "m.gguf", "cache_reuse": 256},
+    )
+    assert "--cache-reuse 256" in " ".join(act.build_argv(req))
+
+
+def test_prefill_relieved_predicate():
+    def win(pre_s, dec_s):
+        return summarize([
+            SimpleNamespace(prompt_seconds_total=0.0, predicted_seconds_total=0.0),
+            SimpleNamespace(prompt_seconds_total=pre_s, predicted_seconds_total=dec_s),
+        ])
+
+    pre = win(14.0, 5.0)   # ~0.74 prefill share (cold)
+    assert prefill_relieved(pre, win(1.0, 5.0)) is True    # ~0.17 -> relieved
+    assert prefill_relieved(pre, win(13.0, 5.0)) is False  # no meaningful drop
+    # Missing counters -> not proven (would roll back).
+    empty = summarize([SimpleNamespace(util_pct=50), SimpleNamespace(util_pct=50)])
+    assert prefill_relieved(pre, empty) is False
+
+
+def test_prefill_bound_opens_prefix_cache_approval():
+    cfg = RemediationConfig(
+        mode=RemediationMode.AUTO, knobs={"model": "m.gguf", "model_n_layers": 48}
+    )
+    mgr = RemediationManager(default_registry(), cfg, [LlamaCppActuator()], now_fn=lambda: 0.0)
+    out = mgr.observe(
+        diag("prefill_bound", metrics={"prefill_fraction": 0.71, "mem_used_ratio": 0.6}),
+        [], now=0.0,
+    )
+    assert out.kind is OutcomeKind.APPROVAL_REQUIRED  # disruptive -> never auto-fires
+    assert out.root_cause is RootCause.COLD_PREFIX_CACHE
+    prev = out.approval.command_preview
+    assert "--cache-reuse 256" in prev
+    # Output-lossless: never proposes KV quantization for this fix.
+    assert "--cache-type-k" not in prev

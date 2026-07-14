@@ -29,6 +29,7 @@ from et_remediation.rootcause import RootCause
 from et_remediation.verify import (
     clock_recovered,
     memory_freed,
+    prefill_relieved,
     throughput_recovered,
     util_recovered,
 )
@@ -166,8 +167,13 @@ def _build_restart_llama(ctx: ActionContext) -> dict:
     else:
         params["n_gpu_layers"] = int(k.get("n_gpu_layers", k.get("model_n_layers", 999)))
 
-    # KV cache: quantize only if it isn't already (avoid needless quality changes).
-    if str(k.get("current_cache_type_k", "")).lower() not in _QUANTIZED_KV:
+    # KV-cache quantization is OUTPUT-ALTERING (q8_0 is near-lossless but not
+    # bit-exact), so per the quality policy it is OPT-IN only — never added to the
+    # default tune. Enable it explicitly with the ``allow_kv_quant`` knob, and even
+    # then only when the cache isn't already quantized.
+    if k.get("allow_kv_quant") and (
+        str(k.get("current_cache_type_k", "")).lower() not in _QUANTIZED_KV
+    ):
         params["cache_type_k"] = k.get("cache_type_k", "q8_0")
         params["cache_type_v"] = k.get("cache_type_v", "q8_0")
 
@@ -282,6 +288,49 @@ def _build_fix_offload(ctx: ActionContext) -> dict:
     }
 
 
+def _build_prefill_cache(ctx: ActionContext) -> dict:
+    """Restart llama-server with prefix caching so long shared prompt prefixes are
+    not reprocessed cold on every request — the fix for PREFILL_BOUND (high TTFT
+    while decode is healthy).
+
+    OUTPUT-LOSSLESS: ``--cache-reuse`` reuses the exact cached KV for a matching
+    prefix; it does not change generated tokens. No KV quantization, no model or
+    quant change — nothing that touches quality. A larger prefill micro-batch is
+    added only with clear VRAM headroom (it speeds the unavoidable cold prefills).
+    Still a restart, so it stays approval-gated + drained like every RESTART spec.
+    """
+    m = ctx.metrics
+    k = ctx.knobs
+    params: dict = {
+        "model": k.get("model"),
+        "restart_command": k.get("restart_command"),
+        "prior_argv": k.get("prior_argv", []),
+        "drain_timeout_s": k.get("drain_timeout_s", 30.0),
+        # Reuse a cached prefix once at least this many tokens match. 256 is a safe
+        # general default; the operator can tune it to their prompt structure.
+        "cache_reuse": int(k.get("cache_reuse", 256)),
+    }
+    # Keep the whole model resident (prefix KV reuse needs it on-GPU); never grow
+    # -ngl into an almost-full card (that would OOM on reload).
+    mem_ratio = m.get("mem_used_ratio")
+    if mem_ratio is None or mem_ratio < 0.90:
+        params["n_gpu_layers"] = int(k.get("n_gpu_layers", k.get("model_n_layers", 999)))
+    elif k.get("n_gpu_layers") is not None:
+        params["n_gpu_layers"] = int(k["n_gpu_layers"])
+    # Flash attention is output-lossless and cuts KV traffic; default on.
+    fa = k.get("flash_attn", True)
+    if fa is not False:
+        params["flash_attn"] = "on" if fa is True else fa
+    # A bigger prefill micro-batch speeds cold prefills but grows compute buffers;
+    # only with clear VRAM headroom, else leave llama.cpp's default.
+    ubatch = k.get("ubatch_size")
+    if ubatch is not None:
+        params["ubatch_size"] = int(ubatch)
+    elif mem_ratio is not None and mem_ratio < 0.80:
+        params["ubatch_size"] = 2048
+    return params
+
+
 # -- specs -------------------------------------------------------------------
 
 THERMAL_POWER_THROTTLE = ActionSpec(
@@ -379,6 +428,24 @@ PARTIAL_GPU_OFFLOAD = ActionSpec(
     requires_drain=True,
 )
 
+PREFILL_COLD_CACHE = ActionSpec(
+    root_cause=RootCause.COLD_PREFIX_CACHE,
+    kind=ActionKind.RESTART_LLAMA_SERVER,
+    action_class=ActionClass.DISRUPTIVE,
+    reversible=True,
+    summary=(
+        "Restart llama-server with prefix caching (--cache-reuse) so long shared "
+        "prompt prefixes aren't reprocessed cold every request (cuts TTFT). "
+        "Output-lossless."
+    ),
+    build_params=_build_prefill_cache,
+    # Success is prefill RELIEF (less time spent on cold prompts), NOT more decode
+    # tok/s — decode was already healthy. Verify on the prefill share so a fix that
+    # genuinely cut TTFT is confirmed and a no-op rolls back.
+    recovered=prefill_relieved,
+    requires_drain=True,
+)
+
 SPEC_DECODE_AT_CEILING = ActionSpec(
     root_cause=RootCause.AT_PRACTICAL_CEILING,
     kind=ActionKind.RESTART_LLAMA_SERVER,
@@ -404,6 +471,7 @@ ALL_STRATEGIES: list[ActionSpec] = [
     DISTRIBUTED_COMM_STALL,
     SUBOPTIMAL_RUNTIME_FLAGS,
     PARTIAL_GPU_OFFLOAD,
+    PREFILL_COLD_CACHE,
     SPEC_DECODE_AT_CEILING,
 ]
 

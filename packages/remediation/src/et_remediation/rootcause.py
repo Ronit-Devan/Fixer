@@ -35,6 +35,10 @@ class RootCause(str, Enum):
     # Layers running on CPU (-ngl too low): restart llama-server with the whole
     # model on the GPU. Disruptive (a restart), so always approval-gated.
     PARTIAL_GPU_OFFLOAD = "partial_gpu_offload"
+    # Long prompts reprocessed cold every request (no prefix reuse): high TTFT
+    # while decode is healthy. Fix = restart llama-server with prefix caching
+    # (--cache-reuse). OUTPUT-LOSSLESS, but a restart, so approval-gated.
+    COLD_PREFIX_CACHE = "cold_prefix_cache"
 
     # --- conditionally remediable (spec decode when draft model is available) ---
     # The box is at the physical single-stream memory-bandwidth wall. A plain flag
@@ -54,6 +58,8 @@ _MONITOR_MAP: dict[str, RootCause] = {
     "memory_headroom": RootCause.SUBOPTIMAL_RUNTIME_FLAGS,
     "kv_cache_pressure": RootCause.SUBOPTIMAL_RUNTIME_FLAGS,
     "gpu_offload_partial": RootCause.PARTIAL_GPU_OFFLOAD,
+    # Prefill-bound (cold long prompts / high TTFT): fix with prefix caching.
+    "prefill_bound": RootCause.COLD_PREFIX_CACHE,
     # VRAM climbing toward OOM (a predictive verdict): try to reclaim stale VRAM
     # non-disruptively before the card OOMs and kills the workload.
     "vram_pressure": RootCause.MEMORY_FRAGMENTATION,

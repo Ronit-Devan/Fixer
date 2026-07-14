@@ -127,10 +127,24 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
       `n_past` (behind `--slots`, privacy-sensitive, usually off) to count warm slots;
       "tokens/TTFT saved" is not derivable without a cache-hit counter. Documented in
       llama.py. Decide in Phase 4 whether to add the /slots reader or leave as-is.
-- [ ] **Phase 3** — Tuned llama-server flag generation in the actuator (behind human
-      gate): -ngl 999, flash-attn, batch/ubatch for prefill, cache-reuse, host-side,
-      spec-decode advisory, KV-quant opt-in; validate flags + VRAM budget; 70 W throttle
-      thresholds sane; safety model intact.
+- [x] **Phase 3** — DONE. Found the remediation layer already had tuned-restart /
+      offload-fix / spec-decode strategies with VRAM guards. Added what was missing for
+      THIS client: (1) a **prefix-cache remediation** for the new PREFILL_BOUND verdict —
+      RootCause.COLD_PREFIX_CACHE, `_build_prefill_cache` (sets `--cache-reuse`, keeps
+      model resident, flash-attn, ubatch on headroom; OUTPUT-LOSSLESS — no KV-quant/model
+      change), ActionSpec PREFILL_COLD_CACHE (DISRUPTIVE/human-gated/drained), mapped
+      `"prefill_bound"`, added `--cache-reuse` to the actuator flag map. Verified on a new
+      `prefill_relieved` predicate (prefill_fraction drop) via a new WindowSummary
+      `prefill_fraction` computed from the Phase-2 time counters. (2) **KV-quant made
+      opt-in** (`allow_kv_quant` knob) in `_build_restart_llama` — was auto-added by
+      default, which violated the quality constraint. Existing VRAM guards (-ngl not
+      grown on full card, draft-model OOM refusal, model-fits check) already satisfy
+      "validate VRAM budget"; spec-decode already advisory (needs draft_model knob).
+      Remediation suite 139 green, monitor 130 green, ruff+mypy clean. Safety model
+      untouched (disruptive still APPROVAL_REQUIRED in AUTO).
+      NOTE: 70 W throttle thresholds — the SET_POWER_LIMIT builder defaults to +15%
+      headroom off the READ current limit (not a hardcoded 300 W assumption), so it
+      scales to a 70 W card. Verify explicitly in Phase 4.
 - [ ] **Phase 4** — Full verification: all package suites + ruff + mypy; fixtures for
       the four scenarios; mock-llama-server integration; adversarial pass (missing/wrong
       GGUF, dense, unknown GPU, partial offload); written summary + open client questions.

@@ -31,6 +31,9 @@ _FLAG_MAP: dict[str, str] = {
     "ubatch_size": "--ubatch-size",
     "ctx_size": "--ctx-size",
     "parallel": "--parallel",
+    # Prefix caching: reuse cached KV for a matching prompt prefix (>= N tokens),
+    # so long shared prefixes aren't reprocessed cold. Output-lossless; cuts TTFT.
+    "cache_reuse": "--cache-reuse",
     "cache_type_k": "--cache-type-k",
     "cache_type_v": "--cache-type-v",
     "model_draft": "--model-draft",  # speculative decoding draft model (-md)

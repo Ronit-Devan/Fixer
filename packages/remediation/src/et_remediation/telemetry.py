@@ -56,6 +56,28 @@ def _vals(samples: Iterable[object], reader) -> list[float]:
     return out
 
 
+def _counter_delta(samples: Sequence[object], attr: str) -> float | None:
+    """Increase of a cumulative counter across the window; None if underivable or
+    the counter went backwards (a server restart reset it)."""
+    vals = _vals(samples, lambda s: _get(s, attr))
+    if len(vals) < 2:
+        return None
+    d = vals[-1] - vals[0]
+    return d if d >= 0 else None
+
+
+def _prefill_fraction(samples: Sequence[object]) -> float | None:
+    """Share of serving time spent prefilling (vs decoding) across the window,
+    from llama-server's exact ``*_seconds_total`` counters. High => cold-prefill /
+    TTFT-dominated. This is what a prefix-cache fix should DROP, so it's the
+    recovery signal for the PREFILL_BOUND remediation."""
+    d_pre = _counter_delta(samples, "prompt_seconds_total")
+    d_dec = _counter_delta(samples, "predicted_seconds_total")
+    if d_pre is None or d_dec is None or (d_pre + d_dec) <= 0:
+        return None
+    return d_pre / (d_pre + d_dec)
+
+
 @dataclass(frozen=True)
 class WindowSummary:
     """Aggregates over a telemetry window; the unit the recovery checks compare.
@@ -78,6 +100,9 @@ class WindowSummary:
     # signal for a llama.cpp flag change: a batching/offload fix lifts tokens/sec
     # while single-stream util barely moves. None when the source has no token rate.
     mean_gen_tokens_per_s: float | None = None
+    # Share of serving time spent prefilling (from *_seconds_total counters). The
+    # success signal for a prefix-cache fix: it should FALL. None if unknown.
+    prefill_fraction: float | None = None
 
 
 def summarize(samples: Sequence[object]) -> WindowSummary:
@@ -100,4 +125,5 @@ def summarize(samples: Sequence[object]) -> WindowSummary:
         mean_requests_processing=mean(reqs) if reqs else None,
         max_kv_cache_ratio=max(kv) if kv else None,
         mean_gen_tokens_per_s=mean(tps) if tps else None,
+        prefill_fraction=_prefill_fraction(samples),
     )

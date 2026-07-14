@@ -69,6 +69,23 @@ def throughput_recovered(
     return gain >= min_abs_tok_s and gain >= pre.mean_gen_tokens_per_s * min_gain_frac
 
 
+def prefill_relieved(
+    pre: WindowSummary, post: WindowSummary, *, min_drop: float = 0.10
+) -> bool:
+    """Prefill's share of serving time fell after the fix — prefix caching cut the
+    cold prompt reprocessing that was dominating wall-time (TTFT).
+
+    This, not tokens/sec, is the right success signal for a prefix-cache restart:
+    decode throughput is unchanged (it was already healthy); what improves is that
+    less time is spent prefilling. Conservative: if either window lacks the
+    prefill share, recovery is NOT proven (returns False) so it rolls back rather
+    than confirming on absent data.
+    """
+    if pre.prefill_fraction is None or post.prefill_fraction is None:
+        return False
+    return pre.prefill_fraction - post.prefill_fraction >= min_drop
+
+
 def memory_freed(
     pre: WindowSummary, post: WindowSummary, *, min_drop_ratio: float = 0.10
 ) -> bool:
