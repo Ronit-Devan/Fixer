@@ -66,6 +66,11 @@ class Snapshot:
     # per-tick rates above).
     prompt_tokens_total: float | None = None
     predicted_tokens_total: float | None = None
+    # Cumulative prefill/decode WALL-TIME (llama-server *_seconds_total counters).
+    # Their deltas give the exact prefill-vs-decode time split over a window — the
+    # measured basis for PREFILL_BOUND, no throughput estimate needed.
+    prompt_seconds_total: float | None = None
+    predicted_seconds_total: float | None = None
     # Time-to-first-token for a representative recent request, when known (filled
     # precisely from /slots timings in Phase 2). None => not directly observed;
     # the analyzer falls back to the prefill share of serving time.

@@ -95,13 +95,21 @@ def _counter_delta(window: list[Snapshot], attr: str) -> float | None:
 def _prefill_fraction(
     window: list[Snapshot], prefill_tps: float | None, decode_tps: float | None
 ) -> float | None:
-    """Share of the window's token-processing TIME spent on prefill vs decode.
+    """Share of the window's serving TIME spent on prefill vs decode.
 
-    Splits work by counter deltas (prompt vs predicted tokens) divided by each
-    phase's representative throughput. ~0.7 means most of the wall-clock went to
-    prompt processing (cold prefill / high TTFT), even if the decode rate is high.
-    None when there isn't enough signal to tell.
+    ~0.7 means most of the wall-clock went to prompt processing (cold prefill /
+    high TTFT), even if the decode rate is high. None when there isn't enough
+    signal to tell.
+
+    Preferred path: the exact prefill/decode wall-time from llama-server's
+    ``*_seconds_total`` counters — measured, no estimate. Fallback (older servers
+    without those counters): estimate each phase's time from its token-counter
+    delta over its representative throughput.
     """
+    d_pre_s = _counter_delta(window, "prompt_seconds_total")
+    d_dec_s = _counter_delta(window, "predicted_seconds_total")
+    if d_pre_s is not None and d_dec_s is not None and (d_pre_s + d_dec_s) > 0:
+        return d_pre_s / (d_pre_s + d_dec_s)
     if not prefill_tps or not decode_tps:
         return None
     d_prompt = _counter_delta(window, "prompt_tokens_total")
@@ -112,6 +120,22 @@ def _prefill_fraction(
     t_dec = d_decode / decode_tps
     total = t_pre + t_dec
     return t_pre / total if total > 0 else None
+
+
+def _kv_headroom_gb(
+    spec: WorkloadSpec | None, mean_total_mb: float | None, activation_gb: float = 1.0
+) -> float | None:
+    """VRAM (GB) left for the KV cache after resident weights + a fixed activation
+    reserve. Uses the FULL model footprint (``bytes_on_gpu``), not the MoE
+    per-token bytes — every expert is resident even though only a few stream per
+    token. None when the model size or total VRAM is unknown.
+    """
+    if spec is None or mean_total_mb is None:
+        return None
+    resident = spec.bytes_on_gpu()
+    if resident is None:
+        return None
+    return (mean_total_mb / 1024.0) - (resident / 1e9) - activation_gb
 
 
 def _make(
@@ -322,6 +346,11 @@ def analyze(
             metrics["prefill_fraction"] = round(prefill_fraction, 3)
     if ttft is not None:
         metrics["ttft_s"] = round(ttft, 3)
+    # VRAM left for the KV cache after resident weights — how much context/how many
+    # slots this box can actually hold (drives KV-pressure advice + remediation).
+    kv_headroom_gb = _kv_headroom_gb(spec, mean_total_mb)
+    if kv_headroom_gb is not None:
+        metrics["kv_headroom_gb"] = round(kv_headroom_gb, 2)
 
     # Decode roofline (only when a spec gives us the model+bandwidth facts). The
     # numbers ride into every diagnosis's metrics so the UI and remediation can
@@ -369,6 +398,39 @@ def analyze(
         max_kv >= t.kv_pressure_ratio
         or (max_deferred >= 1 and max_kv >= t.kv_defer_pressure_ratio)
     ):
+        # On a 24 GB box already holding big weights there may be no VRAM left to
+        # grow the cache into; "just raise --ctx-size" would OOM. When headroom is
+        # tight, lead with the levers that FREE room instead.
+        tight = kv_headroom_gb is not None and kv_headroom_gb < 2.0
+        bigger_ctx = (
+            f"This card has only ~{kv_headroom_gb:.1f} GB free after weights — not "
+            "enough to grow the cache, so do NOT just raise --ctx-size; free room first."
+            if tight
+            else "If the VRAM tile shows headroom, give the cache more room: restart "
+            "llama-server with a larger --ctx-size (e.g. double it)."
+        )
+        kvq = (
+            "Fit more context in the same VRAM by quantizing the KV cache: add "
+            " --flash-attn --cache-type-k q8_0 --cache-type-v q8_0  (q8_0 is "
+            "near-lossless but DOES slightly change outputs — opt-in, quality-affecting)."
+        )
+        parallel = (
+            "If you over-committed concurrent slots, lower --parallel so requests "
+            "stop exhausting the cache."
+        )
+        prompt_cache = (
+            "Avoid recomputing shared prefixes: enable prompt caching "
+            "( --prompt-cache <file> / --cache-reuse N ) and reuse it across requests."
+        )
+        scale_out = (
+            "If this stays pinned at capacity, scale out: run a second llama-server "
+            "instance/box behind a load balancer."
+        )
+        kv_recs = (
+            [bigger_ctx, parallel, kvq, prompt_cache, scale_out]
+            if tight
+            else [bigger_ctx, kvq, parallel, prompt_cache, scale_out]
+        )
         return _make(
             Verdict.KV_CACHE_PRESSURE,
             "warn",
@@ -384,14 +446,13 @@ def analyze(
                 f"Peak KV-cache usage: {max_kv:.0%}",
                 f"Max requests deferred: {max_deferred:.0f}",
                 f"Mean utilization: {mean_util:.0f}%",
+                *(
+                    [f"VRAM left for KV after weights: ~{kv_headroom_gb:.1f} GB"]
+                    if kv_headroom_gb is not None
+                    else []
+                ),
             ],
-            [
-                "If the VRAM tile shows headroom, give the cache more room: restart llama-server with a larger --ctx-size (e.g. double it).",
-                "Fit more context in the same VRAM by quantizing the KV cache: add  --flash-attn --cache-type-k q8_0 --cache-type-v q8_0 .",
-                "If you over-committed concurrent slots, lower --parallel so requests stop exhausting the cache.",
-                "Avoid recomputing shared prefixes: enable prompt caching ( --prompt-cache <file> ) and reuse it across requests.",
-                "If this stays pinned at capacity, scale out: run a second llama-server instance/box behind a load balancer.",
-            ],
+            kv_recs,
             metrics,
         )
 

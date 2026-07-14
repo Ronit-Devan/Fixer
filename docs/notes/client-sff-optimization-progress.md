@@ -110,9 +110,23 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
       + decode-rate-is-not-end-to-end. Monitor suite 127 green; ruff+mypy clean.
       NOTE: ttft_s currently always None (Phase 2 /slots will populate it precisely);
       the verdict uses prefill_fraction, which is available now.
-- [ ] **Phase 2** — Prefix-cache observability from `/metrics` + `/slots` (verify real
-      field names): hit rate, tokens saved, TTFT saved, KV occupancy vs 24 GB; verdict
-      for repeatedly-cold long-context; predictive KV-saturation tuned to weights+30K KV.
+- [~] **Phase 2** — MOSTLY DONE (scoped to what llama.cpp actually exposes). KEY
+      FINDING: llama.cpp exposes **no direct prefix-cache-hit counter** (verified vs
+      server README) — do NOT chase one. It DOES expose exact prefill/decode wall-time
+      (`prompt_seconds_total`, `tokens_predicted_seconds_total`); added those +
+      `n_busy_slots_per_decode` to the scraper/snapshot. `_prefill_fraction` now uses the
+      exact time counters (throughput estimate is fallback) — warm vs cold cache is
+      visible as prefill-time collapse, which IS the cache-effectiveness signal, and
+      feeds PREFILL_BOUND (the repeatedly-cold-long-context verdict). Added
+      `_kv_headroom_gb` (VRAM left for KV after full resident weights, using full
+      footprint not MoE active) -> `kv_headroom_gb` metric; KV_CACHE_PRESSURE advice is
+      now headroom-aware (won't say "raise --ctx-size" when it would OOM) and labels
+      KV-quant as output-altering/opt-in (quality constraint). Monitor suite 130 green,
+      ruff+mypy clean.
+      REMAINING (optional, lower value): a best-effort `/slots` reader for per-slot
+      `n_past` (behind `--slots`, privacy-sensitive, usually off) to count warm slots;
+      "tokens/TTFT saved" is not derivable without a cache-hit counter. Documented in
+      llama.py. Decide in Phase 4 whether to add the /slots reader or leave as-is.
 - [ ] **Phase 3** — Tuned llama-server flag generation in the actuator (behind human
       gate): -ngl 999, flash-attn, batch/ubatch for prefill, cache-reuse, host-side,
       spec-decode advisory, KV-quant opt-in; validate flags + VRAM budget; 70 W throttle

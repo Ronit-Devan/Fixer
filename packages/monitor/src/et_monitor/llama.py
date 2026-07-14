@@ -13,6 +13,8 @@ runs in NVML-only mode. It never raises into the sampling loop.
 Reference metric names (llama.cpp examples/server):
   llamacpp:prompt_tokens_total            counter
   llamacpp:tokens_predicted_total         counter
+  llamacpp:prompt_seconds_total           counter (cumulative prefill wall-time)
+  llamacpp:tokens_predicted_seconds_total counter (cumulative decode wall-time)
   llamacpp:prompt_tokens_seconds          gauge  (avg prompt throughput)
   llamacpp:predicted_tokens_seconds       gauge  (avg generation throughput)
   llamacpp:kv_cache_usage_ratio           gauge  (0..1)
@@ -20,7 +22,17 @@ Reference metric names (llama.cpp examples/server):
   llamacpp:requests_processing            gauge  (active slots)
   llamacpp:requests_deferred              gauge  (queued, waiting for a slot)
   llamacpp:n_decode_total                 counter
+  llamacpp:n_busy_slots_per_decode        gauge  (avg busy slots per decode step)
 We parse the whole exposition generically, then read the keys we know.
+
+The ``*_seconds_total`` counters are the exact cumulative time spent in prefill
+vs decode, so a window's split into "time processing prompts" vs "time
+generating" is measured, not estimated — the signal behind PREFILL_BOUND.
+
+NOTE: llama.cpp exposes NO direct prefix-cache-hit counter (verified against the
+server README). Cache effectiveness is inferred: a warm long-context request
+shows near-zero prefill time/tokens for its context length. ``/slots`` (behind
+``--slots``) carries per-slot ``n_past`` when enabled; we read it best-effort.
 """
 
 from __future__ import annotations
@@ -43,6 +55,8 @@ class LlamaMetrics:
     # Convenience accessors for the keys we act on (None if absent).
     prompt_tokens_total: float | None = None
     predicted_tokens_total: float | None = None
+    prompt_seconds_total: float | None = None
+    predicted_seconds_total: float | None = None
     prompt_tokens_seconds: float | None = None
     predicted_tokens_seconds: float | None = None
     kv_cache_usage_ratio: float | None = None
@@ -50,6 +64,7 @@ class LlamaMetrics:
     requests_processing: float | None = None
     requests_deferred: float | None = None
     decode_total: float | None = None
+    busy_slots_per_decode: float | None = None
 
     @property
     def is_active(self) -> bool:
@@ -148,6 +163,8 @@ def metrics_from_raw(raw: dict[str, float], *, timestamp_s: float) -> LlamaMetri
         raw=raw,
         prompt_tokens_total=g("llamacpp:prompt_tokens_total"),
         predicted_tokens_total=g("llamacpp:tokens_predicted_total"),
+        prompt_seconds_total=g("llamacpp:prompt_seconds_total"),
+        predicted_seconds_total=g("llamacpp:tokens_predicted_seconds_total"),
         prompt_tokens_seconds=g("llamacpp:prompt_tokens_seconds"),
         predicted_tokens_seconds=g("llamacpp:predicted_tokens_seconds"),
         kv_cache_usage_ratio=g("llamacpp:kv_cache_usage_ratio"),
@@ -155,6 +172,7 @@ def metrics_from_raw(raw: dict[str, float], *, timestamp_s: float) -> LlamaMetri
         requests_processing=g("llamacpp:requests_processing"),
         requests_deferred=g("llamacpp:requests_deferred"),
         decode_total=g("llamacpp:n_decode_total"),
+        busy_slots_per_decode=g("llamacpp:n_busy_slots_per_decode"),
     )
 
 

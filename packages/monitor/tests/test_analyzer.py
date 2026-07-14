@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from et_monitor.analyzer import Thresholds, analyze
+from et_monitor.perf import WorkloadSpec
 from et_monitor.types import Snapshot, Verdict
 
 T = Thresholds()
@@ -111,11 +112,14 @@ def test_gpu_only_mode_idle_without_llama():
 
 
 def _prefill_scenario(prompt_tokens, decode_tokens, prefill_tps, decode_tps,
-                      *, util_pct=70.0, mem_used_mb=14000.0, n=8):
+                      *, util_pct=70.0, mem_used_mb=14000.0, n=8,
+                      prefill_seconds=None, decode_seconds=None):
     """A window where, over its span, ``prompt_tokens`` were prefilled at
     ``prefill_tps`` and ``decode_tokens`` decoded at ``decode_tps`` — so the
     analyzer's prefill-share math reproduces a real serving scenario. Counters
-    rise linearly; GPU gauges are held flat so the predictive path stays quiet."""
+    rise linearly; GPU gauges are held flat so the predictive path stays quiet.
+    Pass ``prefill_seconds``/``decode_seconds`` to exercise the exact time-counter
+    path (llama-server ``*_seconds_total``) instead of the throughput estimate."""
     snaps = []
     for i in range(n):
         f = i / (n - 1)
@@ -138,6 +142,8 @@ def _prefill_scenario(prompt_tokens, decode_tokens, prefill_tps, decode_tps,
             prompt_tokens_per_s=prefill_tps,
             prompt_tokens_total=prompt_tokens * f,
             predicted_tokens_total=decode_tokens * f,
+            prompt_seconds_total=None if prefill_seconds is None else prefill_seconds * f,
+            predicted_seconds_total=None if decode_seconds is None else decode_seconds * f,
         ))
     return snaps
 
@@ -190,3 +196,45 @@ def test_decode_rate_is_not_end_to_end_rate():
     d = analyze(w, T)
     assert d.metrics["gen_tokens_per_s"] == 73.0
     assert d.metrics["prefill_tokens_per_s"] == 2143.0
+
+
+def test_prefill_fraction_prefers_exact_time_counters():
+    # With the *_seconds_total counters present, prefill_fraction is measured
+    # exactly (14s prefill / 19.75s total ~ 0.71), regardless of the token rates.
+    w = _prefill_scenario(
+        30000, 420, prefill_tps=1.0, decode_tps=1.0,  # deliberately wrong rates
+        util_pct=88.0, prefill_seconds=14.0, decode_seconds=5.75,
+    )
+    d = analyze(w, T)
+    assert d.verdict == Verdict.PREFILL_BOUND
+    assert abs(d.metrics["prefill_fraction"] - 14.0 / 19.75) < 0.01
+
+
+# -- KV headroom vs the VRAM budget -----------------------------------------
+
+
+def test_kv_headroom_surfaced_and_tightens_advice():
+    # 22 GB of weights on a 24 GB card -> ~1 GB left for KV: pressure advice must
+    # NOT tell the user to raise --ctx-size (it would OOM).
+    spec = WorkloadSpec(model_bytes=22e9, n_layers=48, n_gpu_layers=48,
+                        mem_bandwidth_gb_s=432.0)
+    w = _window(util_pct=70.0, kv_cache_usage_ratio=0.95, requests_processing=3.0,
+                mem_used_mb=23000.0, mem_total_mb=24000.0)
+    d = analyze(w, T, spec)
+    assert d.verdict == Verdict.KV_CACHE_PRESSURE
+    assert d.metrics["kv_headroom_gb"] < 2.0
+    assert any("do NOT just raise --ctx-size" in r for r in d.recommendations)
+    # KV-cache quantization must be labeled as output-altering / opt-in.
+    assert any("cache-type-k" in r and "opt-in" in r.lower() for r in d.recommendations)
+
+
+def test_kv_headroom_ample_keeps_ctx_advice():
+    # 8 GB of weights on 24 GB -> plenty of KV room: the ctx-size lever stays.
+    spec = WorkloadSpec(model_bytes=8e9, n_layers=48, n_gpu_layers=48,
+                        mem_bandwidth_gb_s=432.0)
+    w = _window(util_pct=70.0, kv_cache_usage_ratio=0.95, requests_processing=3.0,
+                mem_used_mb=12000.0, mem_total_mb=24000.0)
+    d = analyze(w, T, spec)
+    assert d.verdict == Verdict.KV_CACHE_PRESSURE
+    assert d.metrics["kv_headroom_gb"] > 10.0
+    assert any("--ctx-size" in r and "do NOT" not in r for r in d.recommendations)
