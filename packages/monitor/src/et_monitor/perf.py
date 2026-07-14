@@ -2,10 +2,13 @@
 physical ceiling are we", so a bare number like "40%" stops being ambiguous.
 
 A llama.cpp box serving ONE stream is *memory-bandwidth bound* during decode:
-every generated token streams the (quantized) weights resident on the GPU once.
-So the single-stream decode ceiling is
+every generated token streams the weights it touches once. For a DENSE model
+that's the whole (quantized) weight set; for a MIXTURE-OF-EXPERTS model it's only
+the *active* experts plus the always-on weights — often ~10x fewer bytes than the
+full file, which is why an MoE like Qwen3-30B-A3B decodes far faster than its
+30 GB footprint would suggest. So the single-stream decode ceiling is
 
-    ideal_tok_s  = mem_bandwidth_bytes_s / model_bytes_on_gpu
+    ideal_tok_s  = mem_bandwidth_bytes_s / bytes_streamed_per_token
     ceiling_tok_s = achievable_fraction * ideal_tok_s     (real kernels reach
                                                            ~70-90% of spec BW)
     MBU          = gen_tok_s / ideal_tok_s                (fraction of raw BW)
@@ -150,6 +153,18 @@ class GgufInfo:
     name: str | None = None
     n_layers: int | None = None  # <arch>.block_count
     param_count: int | None = None  # general.parameter_count, if present
+    # MoE geometry (all None on a dense model). Used to estimate how many weight
+    # bytes are actually STREAMED per decode token (only the active experts), which
+    # is the memory-bandwidth roofline's true denominator. See
+    # ``estimate_moe_active_bytes``.
+    expert_count: int | None = None  # <arch>.expert_count (routed experts; 0/absent => dense)
+    expert_used_count: int | None = None  # <arch>.expert_used_count (active per token)
+    embedding_length: int | None = None  # <arch>.embedding_length (d_model)
+    expert_ffn_len: int | None = None  # <arch>.expert_feed_forward_length
+
+    @property
+    def is_moe(self) -> bool:
+        return bool(self.expert_count and self.expert_count > 1 and self.expert_used_count)
 
 
 def _read_gguf_string(f) -> str:
@@ -206,21 +221,50 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
             name: str | None = None
             n_layers: int | None = None
             param_count: int | None = None
+            expert_count: int | None = None
+            expert_used_count: int | None = None
+            embedding_length: int | None = None
+            expert_ffn_len: int | None = None
+            # Fixed-width integer metadata we capture, keyed by the suffix its GGUF
+            # key ends with. Order matters only for display; each is distinct.
+            _int_suffixes = (
+                ".block_count",
+                ".expert_used_count",  # before .expert_count (not a substring, but explicit)
+                ".expert_count",
+                ".embedding_length",
+                ".expert_feed_forward_length",
+            )
 
             for _ in range(min(kv_count, max_kv)):
                 key = _read_gguf_string(f)
                 (vtype,) = struct.unpack("<I", f.read(4))
+                # All model metadata (incl. every MoE geometry key) precedes the
+                # tokenizer arrays in the GGUFs we target; stop at the first
+                # tokenizer key so the giant vocab arrays are never walked (the
+                # efficiency floor the original early-break protected).
+                if key.startswith("tokenizer."):
+                    break
+                matched_suffix = next(
+                    (s for s in _int_suffixes if key.endswith(s)), None
+                )
                 if vtype in _GGUF_FIXED and (
-                    key.endswith(".block_count")
-                    or key == "general.parameter_count"
-                    or key == "general.architecture"  # never fixed, but be safe
+                    matched_suffix is not None or key == "general.parameter_count"
                 ):
                     raw = f.read(_GGUF_FIXED[vtype][1])
                     (val,) = struct.unpack(_GGUF_FIXED[vtype][0], raw)
-                    if key.endswith(".block_count"):
-                        n_layers = int(val)
+                    ival = int(val)
+                    if matched_suffix == ".block_count":
+                        n_layers = ival
+                    elif matched_suffix == ".expert_used_count":
+                        expert_used_count = ival
+                    elif matched_suffix == ".expert_count":
+                        expert_count = ival
+                    elif matched_suffix == ".embedding_length":
+                        embedding_length = ival
+                    elif matched_suffix == ".expert_feed_forward_length":
+                        expert_ffn_len = ival
                     elif key == "general.parameter_count":
-                        param_count = int(val)
+                        param_count = ival
                 elif vtype == _GGUF_STRING and key in (
                     "general.architecture",
                     "general.name",
@@ -232,8 +276,6 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                         name = s
                 else:
                     _skip_gguf_value(f, vtype)
-                if arch is not None and n_layers is not None:
-                    break  # have what we need; skip the tokenizer arrays entirely
             return GgufInfo(
                 path=str(p),
                 file_bytes=file_bytes,
@@ -241,9 +283,64 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                 name=name,
                 n_layers=n_layers,
                 param_count=param_count,
+                expert_count=expert_count,
+                expert_used_count=expert_used_count,
+                embedding_length=embedding_length,
+                expert_ffn_len=expert_ffn_len,
             )
     except (OSError, struct.error, ValueError, MemoryError, OverflowError):
         return None
+
+
+def estimate_moe_active_bytes(info: GgufInfo) -> tuple[float | None, str]:
+    """Estimate the weight BYTES streamed per decode token for a model.
+
+    A dense model reads all of its weights every token, so the roofline divides
+    bandwidth by the full weight bytes. An MoE reads only the *active* experts
+    (``expert_used_count`` of ``expert_count``) plus the always-on weights
+    (attention, embeddings, shared experts, norms) each token — often ~10x fewer
+    bytes than the full file. Dividing by the full file would report an MBU near
+    a tenth of reality and a ceiling ~10x too low, so for an MoE we estimate the
+    active bytes.
+
+    Returns ``(active_bytes, note)``. ``active_bytes`` is None for a dense model
+    (the caller then uses the full weight bytes). Never raises.
+
+    The accurate path scales the full weight bytes by the fraction of total
+    parameters that are actually touched: total minus the routed-expert params
+    that are NOT selected this token. Routed-expert params per layer are
+    ``expert_count * 3 * d_model * expert_ffn_len`` (SwiGLU gate/up/down). It
+    assumes ~uniform bits-per-weight across tensors (true within one quant) and
+    needs a total ``param_count`` to normalize. If the geometry or param count is
+    missing it falls back to the routed-expert activation ratio alone, which
+    ignores always-on weights and so slightly over-states the ceiling.
+    """
+    ec = info.expert_count
+    euc = info.expert_used_count
+    mb = float(info.file_bytes) if info.file_bytes else None
+    if not ec or ec <= 1 or not euc or not mb:
+        return None, "dense (all weights streamed per token)"
+    expert_ratio = euc / ec
+    d = info.embedding_length
+    eff = info.expert_ffn_len
+    nl = info.n_layers
+    pc = info.param_count
+    if d and eff and nl and pc and pc > 0:
+        per_expert = 3 * d * eff  # SwiGLU: gate + up + down
+        routed = nl * ec * per_expert
+        inactive = routed * (1.0 - expert_ratio)
+        active_frac = (pc - inactive) / pc
+        # Active fraction can't drop below the pure routed-expert ratio (always-on
+        # weights only ADD to it) nor exceed 1.0; clamp to guard a garbage read.
+        active_frac = min(1.0, max(active_frac, expert_ratio))
+        return mb * active_frac, (
+            f"MoE: ~{active_frac:.0%} of weights active per token "
+            f"({euc}/{ec} experts + always-on)"
+        )
+    return mb * expert_ratio, (
+        f"MoE (coarse): {euc}/{ec} routed experts active; geometry incomplete, "
+        "so the ceiling is an upper bound — set --active-bytes to refine"
+    )
 
 
 # --- the workload spec + roofline ------------------------------------------
@@ -259,6 +356,10 @@ class WorkloadSpec:
     """
 
     model_bytes: float | None = None  # full quantized weight bytes (~GGUF size)
+    # MoE: weight bytes STREAMED per decode token (active experts + always-on).
+    # None => dense, so the full ``model_bytes`` is streamed. This is the roofline
+    # denominator; ``model_bytes`` stays the full VRAM footprint (offload / fit).
+    active_bytes: float | None = None
     n_layers: int | None = None
     n_gpu_layers: int | None = None  # configured -ngl; None/<0 => treat as all
     mem_bandwidth_gb_s: float | None = None
@@ -286,10 +387,30 @@ class WorkloadSpec:
     def has_roofline(self) -> bool:
         return bool(self.model_bytes and self.mem_bandwidth_gb_s)
 
+    @property
+    def is_moe(self) -> bool:
+        """True when an active-bytes estimate below the full weights is set."""
+        return bool(
+            self.active_bytes
+            and self.model_bytes
+            and self.active_bytes < self.model_bytes
+        )
+
     def bytes_on_gpu(self) -> float | None:
+        """Full resident weight bytes on the GPU (VRAM footprint × offload)."""
         if self.model_bytes is None:
             return None
         return self.model_bytes * self.offload_fraction
+
+    def per_token_bytes(self) -> float | None:
+        """Weight bytes streamed from the GPU per decode token — the roofline's
+        denominator. For an MoE this is the active-expert bytes, NOT the full
+        model; for a dense model it's the full weights. Scaled by the resident
+        fraction so partial offload reads as fewer GPU-streamed bytes."""
+        base = self.active_bytes if self.active_bytes else self.model_bytes
+        if base is None:
+            return None
+        return base * self.offload_fraction
 
     # -- persistence ---------------------------------------------------------
 
@@ -369,13 +490,13 @@ def roofline(
         return None
     offload = spec.offload_fraction
     partial = offload < 0.98
-    bytes_on_gpu = spec.bytes_on_gpu()
+    per_tok_bytes = spec.per_token_bytes()  # active experts (MoE) or full weights (dense)
     bw_bytes_s = (
         spec.mem_bandwidth_gb_s * 1e9 if spec.mem_bandwidth_gb_s else None
     )
     ideal = ceiling = mbu = tput = None
-    if bw_bytes_s and bytes_on_gpu and bytes_on_gpu > 0:
-        ideal = bw_bytes_s / bytes_on_gpu
+    if bw_bytes_s and per_tok_bytes and per_tok_bytes > 0:
+        ideal = bw_bytes_s / per_tok_bytes
         ceiling = spec.achievable_fraction * ideal
         if gen_tok_s is not None and ideal > 0:
             mbu = gen_tok_s / ideal

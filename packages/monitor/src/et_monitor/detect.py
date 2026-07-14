@@ -25,6 +25,7 @@ from et_monitor.perf import (
     WorkloadSpec,
     bandwidth_for,
     default_spec_path,
+    estimate_moe_active_bytes,
     read_gguf_metadata,
     roofline,
 )
@@ -65,6 +66,7 @@ def build_workload_spec(
     model_name: str | None = None
     n_layers: int | None = None
     model_bytes: float | None = None
+    active_bytes: float | None = None
 
     # 1) Ask the live server for its launch config.
     if llama_url:
@@ -88,6 +90,12 @@ def build_workload_spec(
                 f"model: {model_name or model_path} "
                 f"({model_bytes / 1e9:.1f} GB, {n_layers or '?'} layers)"
             )
+            active_bytes, moe_note = estimate_moe_active_bytes(info)
+            if active_bytes is not None:
+                notes.append(
+                    f"  {moe_note}: ~{active_bytes / 1e9:.1f} GB streamed/token "
+                    f"(vs {model_bytes / 1e9:.1f} GB resident) -> that drives the ceiling"
+                )
         else:
             notes.append(f"model: {model_path} is not a readable GGUF (ok)")
     elif model_path:
@@ -108,6 +116,7 @@ def build_workload_spec(
 
     spec = WorkloadSpec(
         model_bytes=model_bytes,
+        active_bytes=active_bytes,
         n_layers=n_layers,
         n_gpu_layers=n_gpu_layers,
         mem_bandwidth_gb_s=mem_bandwidth_gb_s,
@@ -148,6 +157,12 @@ def roofline_preview(
     rl = roofline(spec, gen_tok_s, concurrency=1.0)
     assert rl is not None
     lines.append(f"Single-stream decode ceiling: ~{rl.ceiling_tok_s:.0f} tok/s")
+    if spec.is_moe and spec.active_bytes and spec.model_bytes:
+        lines.append(
+            f"  (MoE: ~{spec.active_bytes / 1e9:.1f} GB active/token of "
+            f"{spec.model_bytes / 1e9:.1f} GB resident sets this ceiling, not the "
+            "full footprint)"
+        )
     if rl.partial_offload:
         lines.append(
             f"  WARNING: only {rl.offload_fraction:.0%} of the model is on the GPU "

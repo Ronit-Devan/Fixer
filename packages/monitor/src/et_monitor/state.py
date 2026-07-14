@@ -650,6 +650,10 @@ def _workload_dict(spec: WorkloadSpec | None) -> dict | None:
         "gpu_name": spec.gpu_name,
         "mem_bandwidth_gb_s": spec.mem_bandwidth_gb_s,
         "model_gb": round(spec.model_bytes / 1e9, 2) if spec.model_bytes else None,
+        # MoE: bytes actually streamed per token (drives the ceiling), distinct
+        # from the full resident footprint above.
+        "is_moe": spec.is_moe,
+        "active_gb": round(spec.active_bytes / 1e9, 2) if spec.active_bytes else None,
         "n_layers": spec.n_layers,
         "n_gpu_layers": spec.n_gpu_layers,
         "offload_fraction": round(spec.offload_fraction, 3),

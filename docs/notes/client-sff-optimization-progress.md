@@ -86,9 +86,18 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
       `pro 2000 blackwell`=288. Verified vs NVIDIA pages: 6000=1792, 5000=1344, 4500=896,
       4000-full=672, 4000-SFF=432, 2000=288. Fixed the test that hard-coded SFF==672;
       added disambiguation + lineup tests. `tests/test_perf.py`+`test_detect.py` green (18).
-- [ ] **Phase 1.2** — MoE-aware roofline: read expert_count/expert_used_count from GGUF;
-      compute active-params bytes/token for MoE decode ceiling; keep never-raises
-      contract; tests for dense (unchanged), MoE, missing-metadata fallback.
+- [x] **Phase 1.2** — DONE. GGUF reader now captures expert_count/expert_used_count/
+      embedding_length/expert_feed_forward_length (verified key names vs llama.cpp
+      gguf-py); stops at first `tokenizer.` key (still skips vocab arrays).
+      `estimate_moe_active_bytes()` scales full weight bytes by active-param fraction
+      (routed-expert geometry + param_count; coarse expert-ratio fallback; clamped
+      >= expert ratio; never raises). `WorkloadSpec.active_bytes` + `per_token_bytes()`
+      + `is_moe`; roofline divides by active bytes (NOT full GGUF) so MoE MBU/ceiling
+      are right (~10x). Wired into detect.py + state workload dict. `model_bytes` still
+      = full VRAM footprint (offload/fit unchanged). Tests: dense unchanged, MoE
+      geometry (~A3B), coarse fallback, missing-used-count->dense, clamp, tokenizer-stop,
+      per_token_bytes, roofline-uses-active (incl. the client 94 tok/s => ~0.4 MBU on
+      MoE vs >3x-over-ceiling on wrong-dense). Monitor suite 122 green, ruff+mypy clean.
 - [ ] **Phase 1.3** — Prefill/decode separation as first-class + prefill-bound /
       prefix-cache-cold verdict (high TTFT + healthy decode MBU + long prompt). Tests
       for all four client scenarios.
