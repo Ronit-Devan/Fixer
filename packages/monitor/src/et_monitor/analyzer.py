@@ -47,6 +47,10 @@ class Thresholds:
     kv_defer_pressure_ratio: float = 0.75
     throttle_clock_ratio: float = 0.70  # below this under load = throttling
     throttle_util_pct: float = 60.0  # "under load" floor for throttle check
+    # Prefill dominance: at/above this share of serving time spent processing
+    # prompts (rather than generating), the box is prefill-bound (high TTFT) and
+    # the lever is prefix caching, not decode speed.
+    prefill_bound_fraction: float = 0.5
     min_samples: int = 3  # need this many ticks to call anything
     # --- predictive (early-warning) detection ---
     predict_horizon_s: float = 60.0  # only warn on a crossing within this horizon
@@ -68,6 +72,46 @@ def _vals(window: list[Snapshot], attr: str) -> list[float]:
 def _mean_or(window: list[Snapshot], attr: str, default: float | None = None):
     vs = _vals(window, attr)
     return mean(vs) if vs else default
+
+
+def _mean_positive(window: list[Snapshot], attr: str) -> float | None:
+    """Mean over only the ticks where ``attr`` is > 0 — the representative rate
+    while that phase is actually happening (prefill throughput shouldn't be
+    diluted by the many ticks spent decoding, and vice-versa)."""
+    vs = [v for v in _vals(window, attr) if v > 0]
+    return mean(vs) if vs else None
+
+
+def _counter_delta(window: list[Snapshot], attr: str) -> float | None:
+    """Increase of a cumulative counter across the window; None if underivable or
+    the counter went backwards (a server restart reset it)."""
+    vs = _vals(window, attr)
+    if len(vs) < 2:
+        return None
+    d = vs[-1] - vs[0]
+    return d if d >= 0 else None
+
+
+def _prefill_fraction(
+    window: list[Snapshot], prefill_tps: float | None, decode_tps: float | None
+) -> float | None:
+    """Share of the window's token-processing TIME spent on prefill vs decode.
+
+    Splits work by counter deltas (prompt vs predicted tokens) divided by each
+    phase's representative throughput. ~0.7 means most of the wall-clock went to
+    prompt processing (cold prefill / high TTFT), even if the decode rate is high.
+    None when there isn't enough signal to tell.
+    """
+    if not prefill_tps or not decode_tps:
+        return None
+    d_prompt = _counter_delta(window, "prompt_tokens_total")
+    d_decode = _counter_delta(window, "predicted_tokens_total")
+    if not d_prompt or not d_decode or d_prompt <= 0 or d_decode <= 0:
+        return None
+    t_pre = d_prompt / prefill_tps
+    t_dec = d_decode / decode_tps
+    total = t_pre + t_dec
+    return t_pre / total if total > 0 else None
 
 
 def _make(
@@ -239,6 +283,13 @@ def analyze(
     gen_tps = _mean_or(window, "gen_tokens_per_s", 0.0) or 0.0
     mean_conc = _mean_or(window, "requests_processing", 0.0) or 0.0
     mean_total_mb = _mean_or(window, "mem_total_mb")
+    # Prefill vs decode split (llama only). prefill_tps/decode_tps are the rates
+    # WHILE each phase runs; prefill_fraction is the share of serving time spent
+    # processing prompts (high => cold prefill / TTFT-dominated).
+    prefill_tps = _mean_positive(window, "prompt_tokens_per_s")
+    decode_tps_pos = _mean_positive(window, "gen_tokens_per_s")
+    prefill_fraction = _prefill_fraction(window, prefill_tps, decode_tps_pos)
+    ttft = next((s.ttft_s for s in reversed(window) if s.ttft_s is not None), None)
 
     # "Active" = actually serving a request. With llama metrics we know exactly
     # (requests_processing >= 1); without them we proxy from GPU utilization.
@@ -263,6 +314,14 @@ def analyze(
         "mean_concurrency": round(mean_conc, 2),
         "llama_connected": llama_on,
     }
+    # Prefill/decode split — added only when prefill actually occurred, so a
+    # pure-decode or idle window keeps its existing metrics payload shape.
+    if llama_on and prefill_tps is not None:
+        metrics["prefill_tokens_per_s"] = round(prefill_tps, 1)
+        if prefill_fraction is not None:
+            metrics["prefill_fraction"] = round(prefill_fraction, 3)
+    if ttft is not None:
+        metrics["ttft_s"] = round(ttft, 3)
 
     # Decode roofline (only when a spec gives us the model+bandwidth facts). The
     # numbers ride into every diagnosis's metrics so the UI and remediation can
@@ -441,6 +500,56 @@ def analyze(
                 "A restart is disruptive, so ET only applies it with your approval. After "
                 "it comes back, ET measures whether tokens/sec actually improved and shows "
                 "you — if it didn't, revert to the prior flags.",
+            ],
+            metrics,
+        )
+
+    # --- Rule 3.6: PREFILL_BOUND; wall-time dominated by cold prompt processing.
+    # Decode is healthy, but most of the serving time goes to prefill (long prompts
+    # on a cold cache -> high TTFT). This is the client's 30K-cold case. The lever
+    # is prefix caching / prompt reuse, NOT decode speed, so it must outrank the
+    # decode verdict it would otherwise be misread as (the reported end-to-end
+    # tok/s looks low even though decode is fine).
+    if (
+        llama_on
+        and active_frac >= 0.25
+        and prefill_fraction is not None
+        and prefill_fraction >= t.prefill_bound_fraction
+        and gen_tps > 0
+    ):
+        mbu = rl.mbu if rl is not None else None
+        ttft_ev = (
+            [f"TTFT (recent request): {metrics['ttft_s']:.2f}s"]
+            if "ttft_s" in metrics
+            else []
+        )
+        return _make(
+            Verdict.PREFILL_BOUND,
+            "warn",
+            min(0.95, 0.55 + (prefill_fraction - t.prefill_bound_fraction)),
+            f"{prefill_fraction:.0%} of serving time is spent processing prompts "
+            f"(cold prefill), not generating. Decode itself is healthy "
+            f"(~{gen_tps:.0f} tok/s"
+            + (f", MBU {mbu:.0%}" if mbu is not None else "")
+            + "). The wall-clock cost here is time-to-first-token, so the lever is "
+            "prefix caching / prompt reuse — not decode speed.",
+            [
+                f"Prefill share of serving time: {prefill_fraction:.0%}",
+                *([f"Prefill throughput: {prefill_tps:.0f} tok/s"] if prefill_tps else []),
+                f"Decode: {gen_tps:.0f} tok/s"
+                + (f" (MBU {mbu:.0%})" if mbu is not None else ""),
+                *ttft_ev,
+            ],
+            [
+                "Enable prefix caching so shared prompt prefixes aren't recomputed "
+                "every request: on llama-server use  --cache-reuse N  and keep slots "
+                "warm (this is what took the client's 30K-context TTFT from 14s to 0.3s).",
+                "For a fixed long system prompt / RAG preamble, reuse a saved prompt "
+                "cache ( --prompt-cache <file> --prompt-cache-ro ) across requests.",
+                "Speed the UNAVOIDABLE cold prefills with a larger prefill batch: raise "
+                " -b / -ub  (more prompt tokens per step) if VRAM allows.",
+                "Decode is already near its ceiling — do NOT chase decode tok/s here; "
+                "the win is cutting repeated prompt processing.",
             ],
             metrics,
         )

@@ -11,6 +11,7 @@ class Verdict(str, Enum):
     IDLE_NO_REQUESTS = "idle_no_requests"
     MEMORY_HEADROOM = "memory_headroom"
     DECODE_BANDWIDTH_BOUND = "decode_bandwidth_bound"
+    PREFILL_BOUND = "prefill_bound"  # wall-time dominated by cold prompt processing (TTFT)
     GPU_OFFLOAD_PARTIAL = "gpu_offload_partial"  # layers running on CPU (-ngl too low)
     KV_CACHE_PRESSURE = "kv_cache_pressure"
     THERMAL_THROTTLE = "thermal_throttle"
@@ -24,6 +25,7 @@ VERDICT_TITLES: dict[Verdict, str] = {
     Verdict.IDLE_NO_REQUESTS: "Idle, no inference requests",
     Verdict.MEMORY_HEADROOM: "Memory under-used, room to do more",
     Verdict.DECODE_BANDWIDTH_BOUND: "Decode is memory-bandwidth bound",
+    Verdict.PREFILL_BOUND: "Prefill-bound (cold prompt processing / TTFT)",
     Verdict.GPU_OFFLOAD_PARTIAL: "Model partly on CPU (raise -ngl)",
     Verdict.KV_CACHE_PRESSURE: "KV cache under pressure",
     Verdict.THERMAL_THROTTLE: "GPU is throttling",
@@ -52,9 +54,22 @@ class Snapshot:
     requests_processing: float | None = None
     requests_deferred: float | None = None
     kv_cache_usage_ratio: float | None = None
-    # Derived live rates (computed from counter deltas in state.py)
+    # Derived live rates (computed from counter deltas in state.py). NOTE
+    # gen_tokens_per_s is the PURE DECODE rate (from predicted_tokens_total), and
+    # prompt_tokens_per_s is the PREFILL rate (from prompt_tokens_total) — they are
+    # kept distinct so ET never reports an end-to-end (prefill+decode) number as
+    # the decode rate.
     gen_tokens_per_s: float | None = None
     prompt_tokens_per_s: float | None = None
+    # Cumulative token counters straight from llama-server, so the analyzer can
+    # split a window's serving time into prefill vs decode (distinct from the
+    # per-tick rates above).
+    prompt_tokens_total: float | None = None
+    predicted_tokens_total: float | None = None
+    # Time-to-first-token for a representative recent request, when known (filled
+    # precisely from /slots timings in Phase 2). None => not directly observed;
+    # the analyzer falls back to the prefill share of serving time.
+    ttft_s: float | None = None
     # Static llama-server runtime config (read once from /props; None if unknown).
     # These describe HOW the server was launched, so the analyzer can attribute a
     # bottleneck to a flag (small ctx, unquantized KV, no continuous batching) and

@@ -98,9 +98,18 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
       geometry (~A3B), coarse fallback, missing-used-count->dense, clamp, tokenizer-stop,
       per_token_bytes, roofline-uses-active (incl. the client 94 tok/s => ~0.4 MBU on
       MoE vs >3x-over-ceiling on wrong-dense). Monitor suite 122 green, ruff+mypy clean.
-- [ ] **Phase 1.3** — Prefill/decode separation as first-class + prefill-bound /
-      prefix-cache-cold verdict (high TTFT + healthy decode MBU + long prompt). Tests
-      for all four client scenarios.
+- [x] **Phase 1.3** — DONE. `gen_tokens_per_s` was already pure decode (predicted_*),
+      `prompt_tokens_per_s` pure prefill — documented that invariant in types.py. Added
+      Snapshot.prompt_tokens_total / predicted_tokens_total / ttft_s (populated in
+      state.py + serialized). Analyzer computes `prefill_fraction` = share of serving
+      time spent prefilling (counter deltas / representative throughputs) and surfaces
+      prefill_tokens_per_s / prefill_fraction / ttft_s in metrics. New Verdict.PREFILL_BOUND
+      (Rule 3.6, before decode): fires when prefill_fraction >= 0.5 + decode healthy +
+      active; recommends prefix caching, explicitly says NOT to chase decode. Tests: all
+      four client scenarios (30K-cold->PREFILL_BOUND, short/warm->HEALTHY, 8K-cold<0.5)
+      + decode-rate-is-not-end-to-end. Monitor suite 127 green; ruff+mypy clean.
+      NOTE: ttft_s currently always None (Phase 2 /slots will populate it precisely);
+      the verdict uses prefill_fraction, which is available now.
 - [ ] **Phase 2** — Prefix-cache observability from `/metrics` + `/slots` (verify real
       field names): hit rate, tokens saved, TTFT saved, KV occupancy vs 24 GB; verdict
       for repeatedly-cold long-context; predictive KV-saturation tuned to weights+30K KV.
