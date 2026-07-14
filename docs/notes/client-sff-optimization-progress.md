@@ -1,9 +1,10 @@
 # Client SFF Optimization — Progress / Handoff
 
 **Branch:** `client-sff-optimization`
-**Status:** IN PROGRESS. Updated as work proceeds so this can be resumed on another
-device. To resume: `git checkout client-sff-optimization && git pull`, read this file
-top-to-bottom, then continue at the first unchecked box in "Phase status".
+**Status:** ✅ COMPLETE — all 4 phases done, verified, pushed (538 tests passing).
+The comprehensive hand-off record is in the repo-root **`CLAUDE.md`** (auto-loaded each
+session); this file is the supplementary per-phase log and must not contradict it.
+Final write-up: `client-sff-optimization-summary.md`.
 
 This is an autonomous multi-phase task. Commit + **push** after every logical unit
 (the user explicitly wants pushes so they can continue across devices — this overrides
