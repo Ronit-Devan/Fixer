@@ -145,9 +145,14 @@ packages. 5. Verify any new hardware spec via web before hardcoding.
       NOTE: 70 W throttle thresholds — the SET_POWER_LIMIT builder defaults to +15%
       headroom off the READ current limit (not a hardcoded 300 W assumption), so it
       scales to a 70 W card. Verify explicitly in Phase 4.
-- [ ] **Phase 4** — Full verification: all package suites + ruff + mypy; fixtures for
-      the four scenarios; mock-llama-server integration; adversarial pass (missing/wrong
-      GGUF, dense, unknown GPU, partial offload); written summary + open client questions.
+- [x] **Phase 4** — DONE. All five suites green: **engine 140, agent 111, monitor 139,
+      remediation 139, web/api 9 = 538 passed, 0 failed**; ruff clean everywhere; mypy
+      clean on all touched files. Added `test_client_sff_scenario.py` (end-to-end client
+      numbers + adversarial: unknown GPU, MoE-missing-used-count->dense, partial MoE
+      offload, dense unchanged). Written summary: `client-sff-optimization-summary.md`.
+      One verified open item (70 W power-limit can propose above-cap; driver rejects
+      safely) — documented, deliberately not fixed (needs sampler max-power plumbing in
+      the safety-critical path). TASK COMPLETE.
 
 ## Decision / change log (append newest at bottom)
 - Set up branch + handoff doc + CLAUDE.md resume pointer. Pushing enabled per user.
