@@ -77,11 +77,19 @@ _BANDWIDTH_GB_S: dict[str, float] = {
     "4500 ada": 432.0,
     "4000 ada": 360.0,
     "2000 ada": 288.0,
-    # Blackwell workstation (RTX PRO ... Blackwell) — approx, refine at setup
-    "rtx pro 6000 blackwell": 1792.0,
-    "pro 5000 blackwell": 1344.0,
-    "pro 4500 blackwell": 896.0,
-    "pro 4000 blackwell": 672.0,
+    # Blackwell RTX PRO workstation/server cards. NVML reports names like
+    # "NVIDIA RTX PRO 4000 Blackwell SFF Edition". Verified against NVIDIA spec
+    # pages + TechPowerUp (2026-07). Longest-substring-wins disambiguates the
+    # variants, so the lower-bandwidth SFF (18 Gbps -> 432) and Server 6000
+    # (~1.6 TB/s) MUST out-length their base key or they'd silently inherit the
+    # wrong (higher) bandwidth — the exact bug this table had for the client SFF.
+    "pro 6000 blackwell": 1792.0,          # Workstation / Max-Q (512-bit, 28 Gbps)
+    "pro 6000 blackwell server": 1597.0,   # Server Edition (~1.6 TB/s), lower BW
+    "pro 5000 blackwell": 1344.0,          # 384-bit, 28 Gbps (48/72 GB)
+    "pro 4500 blackwell": 896.0,           # 256-bit, 28 Gbps (32 GB)
+    "pro 4000 blackwell": 672.0,           # full-size (192-bit, 28 Gbps, 140 W)
+    "pro 4000 blackwell sff": 432.0,       # SFF Edition (192-bit, 18 Gbps, 70 W)
+    "pro 2000 blackwell": 288.0,           # 128-bit, 18 Gbps (16 GB)
     "blackwell": 672.0,  # generic fallback for an unrecognized Blackwell SKU
 }
 

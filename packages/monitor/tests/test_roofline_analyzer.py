@@ -112,3 +112,50 @@ def test_no_spec_means_no_roofline_keys():
     d = analyze(_window(), T)  # no spec
     assert "mbu" not in d.metrics
     assert d.verdict in (Verdict.DECODE_BANDWIDTH_BOUND, Verdict.HEALTHY, Verdict.MEMORY_HEADROOM)
+
+
+# --- GPU bandwidth table (Blackwell RTX PRO disambiguation) -----------------
+# Regression for the client-SFF bug: the RTX PRO 4000 Blackwell SFF Edition
+# (432 GB/s, 18 Gbps) must NOT inherit the full-size 4000's 672 GB/s, and every
+# Blackwell-workstation variant must resolve to its verified spec bandwidth.
+
+from et_monitor.perf import bandwidth_for  # noqa: E402
+
+
+def test_bandwidth_sff_vs_full_size_disambiguation():
+    # The whole point: identical prefix, different bandwidth, longest key wins.
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF Edition") == 432.0
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell") == 672.0
+
+
+def test_bandwidth_blackwell_workstation_table():
+    cases = {
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 1792.0,
+        "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": 1792.0,
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition": 1597.0,
+        "NVIDIA RTX PRO 5000 Blackwell": 1344.0,
+        "NVIDIA RTX PRO 4500 Blackwell Workstation Edition": 896.0,
+        "NVIDIA RTX PRO 2000 Blackwell": 288.0,
+    }
+    for name, want in cases.items():
+        assert bandwidth_for(name) == want, name
+
+
+def test_bandwidth_server_6000_not_shadowed_by_workstation():
+    # "pro 6000 blackwell server" must out-length "pro 6000 blackwell".
+    assert bandwidth_for("NVIDIA RTX PRO 6000 Blackwell Server Edition") == 1597.0
+    assert bandwidth_for("NVIDIA RTX PRO 6000 Blackwell Server Edition") != 1792.0
+
+
+def test_bandwidth_unknown_blackwell_falls_back_not_crashes():
+    # A future/unknown Blackwell SKU hits the generic fallback, never None-crashes.
+    assert bandwidth_for("NVIDIA RTX PRO 9999 Blackwell Hypothetical") == 672.0
+    assert bandwidth_for(None) is None
+    assert bandwidth_for("some GPU we have never heard of") is None
+
+
+def test_bandwidth_non_blackwell_unaffected():
+    assert bandwidth_for("NVIDIA GeForce RTX 4090") == 1008.0
+    assert bandwidth_for("NVIDIA GeForce RTX 5090") == 1792.0
+    assert bandwidth_for("NVIDIA RTX A4000") == 448.0  # not shadowed by "a40"
+    assert bandwidth_for("NVIDIA H100 80GB HBM3") == 3350.0

@@ -16,9 +16,13 @@ from et_monitor.perf import (
 
 
 def test_bandwidth_longest_substring_wins():
-    # "rtx pro 4000 blackwell" must beat the generic "blackwell" fallback.
-    bw = bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF")
-    assert bw == 672.0
+    # Longest matching substring wins. The SFF key ("pro 4000 blackwell sff")
+    # must beat the full-size key ("pro 4000 blackwell") which in turn beats the
+    # generic "blackwell" fallback — the SFF is 432 GB/s (18 Gbps), NOT the
+    # full-size 672 (28 Gbps). (This assertion previously codified the bug.)
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell SFF Edition") == 432.0
+    assert bandwidth_for("NVIDIA RTX PRO 4000 Blackwell") == 672.0
+    assert bandwidth_for("NVIDIA RTX PRO 9999 Blackwell") == 672.0  # generic fallback
     assert bandwidth_for("Tesla H100 PCIe") == 3350.0
     assert bandwidth_for("Some Unknown Card 9000") is None
     assert bandwidth_for(None) is None
