@@ -159,3 +159,75 @@ def test_bandwidth_non_blackwell_unaffected():
     assert bandwidth_for("NVIDIA GeForce RTX 5090") == 1792.0
     assert bandwidth_for("NVIDIA RTX A4000") == 448.0  # not shadowed by "a40"
     assert bandwidth_for("NVIDIA H100 80GB HBM3") == 3350.0
+
+
+# --- Prefill-bound verdict: the four client benchmark scenarios --------------
+# Client box: RTX PRO 4000 Blackwell SFF (432 GB/s) serving a ~30B-A3B MoE.
+# active_bytes ~3.8 GB/token -> ideal ~114 tok/s, so the measured 73-94 tok/s
+# decode is HEALTHY (near the single-stream wall). The differentiator across
+# scenarios is TTFT (cold long-context prefill), not decode.
+
+def _client_spec() -> WorkloadSpec:
+    return WorkloadSpec(
+        model_bytes=18e9, active_bytes=3.8e9, n_layers=48, n_gpu_layers=999,
+        mem_bandwidth_gb_s=432.0,
+    )
+
+
+def test_scenario_short_chat_is_healthy_not_prefill_bound():
+    d = analyze(
+        _window(util_pct=48.0, gen_tokens_per_s=94.0, prompt_tokens_per_s=2000.0,
+                ttft_s=0.07, prompt_tokens=40.0),
+        T, _client_spec(),
+    )
+    assert d.verdict != Verdict.PREFILL_BOUND
+    assert d.severity in ("ok", "info")  # at the wall = healthy, nothing to fix
+    assert d.metrics["gen_tokens_per_s"] == 94.0  # decode, never end-to-end
+
+
+def test_scenario_8k_cold_is_prefill_bound():
+    d = analyze(
+        _window(util_pct=50.0, gen_tokens_per_s=85.0, prompt_tokens_per_s=2500.0,
+                ttft_s=3.3, prompt_tokens=8000.0),
+        T, _client_spec(),
+    )
+    assert d.verdict == Verdict.PREFILL_BOUND
+    assert "cache-reuse" in " ".join(d.recommendations)
+    assert d.metrics.get("prefill_bound") is True
+
+
+def test_scenario_30k_cold_is_prefill_bound():
+    d = analyze(
+        _window(util_pct=52.0, gen_tokens_per_s=73.0, prompt_tokens_per_s=2140.0,
+                ttft_s=14.0, prompt_tokens=30000.0),
+        T, _client_spec(),
+    )
+    assert d.verdict == Verdict.PREFILL_BOUND
+    assert d.metrics.get("est_prefill_s") is not None  # ~14s
+
+
+def test_scenario_30k_warm_prefix_cache_is_healthy():
+    # Warm prefix cache -> TTFT collapses to 0.31s, so NOT prefill-bound even
+    # though the prompt is 30K. Decode ~80 tok/s is near the wall -> healthy.
+    d = analyze(
+        _window(util_pct=48.0, gen_tokens_per_s=80.0, prompt_tokens_per_s=90000.0,
+                ttft_s=0.31, prompt_tokens=30000.0, cache_tokens=29900.0),
+        T, _client_spec(),
+    )
+    assert d.verdict != Verdict.PREFILL_BOUND
+    assert d.severity in ("ok", "info")
+
+
+def test_prefill_bound_not_fired_when_decode_is_actually_broken():
+    # High TTFT + long prompt but decode is genuinely poor (partial offload):
+    # partial-offload must win; we must NOT mislabel a decode bug as prefill.
+    spec = WorkloadSpec(
+        model_bytes=18e9, active_bytes=3.8e9, n_layers=48, n_gpu_layers=8,
+        mem_bandwidth_gb_s=432.0,
+    )
+    d = analyze(
+        _window(util_pct=40.0, gen_tokens_per_s=12.0, prompt_tokens_per_s=300.0,
+                ttft_s=10.0, prompt_tokens=30000.0),
+        T, spec,
+    )
+    assert d.verdict == Verdict.GPU_OFFLOAD_PARTIAL

@@ -48,6 +48,14 @@ class Thresholds:
     throttle_clock_ratio: float = 0.70  # below this under load = throttling
     throttle_util_pct: float = 60.0  # "under load" floor for throttle check
     min_samples: int = 3  # need this many ticks to call anything
+    # --- prefill-bound (cold long-context) detection ---
+    # A request whose time-to-first-token is >= this, on a prompt at least
+    # prefill_prompt_tokens long, while DECODE is healthy, is prefill-bound: the
+    # wall time is prompt processing, not generation. The fix is prefix caching /
+    # prefill batch, never a decode lever.
+    prefill_ttft_s: float = 2.0
+    prefill_prompt_tokens: float = 4000.0
+    prefill_decode_healthy_mbu: float = 0.5  # decode is "fine" at/above this MBU
     # --- predictive (early-warning) detection ---
     predict_horizon_s: float = 60.0  # only warn on a crossing within this horizon
     throttle_temp_c: float = 84.0  # temperature that tends to trigger HW throttle
@@ -239,6 +247,9 @@ def analyze(
     gen_tps = _mean_or(window, "gen_tokens_per_s", 0.0) or 0.0
     mean_conc = _mean_or(window, "requests_processing", 0.0) or 0.0
     mean_total_mb = _mean_or(window, "mem_total_mb")
+    mean_prompt_tps = _mean_or(window, "prompt_tokens_per_s")
+    max_ttft = max(_vals(window, "ttft_s"), default=0.0)
+    max_prompt_tokens = max(_vals(window, "prompt_tokens"), default=0.0)
 
     # "Active" = actually serving a request. With llama metrics we know exactly
     # (requests_processing >= 1); without them we proxy from GPU utilization.
@@ -263,6 +274,15 @@ def analyze(
         "mean_concurrency": round(mean_conc, 2),
         "llama_connected": llama_on,
     }
+    # Prefill/prefix signals — added only when present so the metrics payload is
+    # unchanged for boxes/tests that don't report them. Decode tok/s (above) is
+    # NEVER conflated with these: gen_tokens_per_s is generation only.
+    if mean_prompt_tps is not None:
+        metrics["prompt_tokens_per_s"] = round(mean_prompt_tps, 1)
+    if max_ttft > 0:
+        metrics["ttft_s"] = round(max_ttft, 2)
+    if max_prompt_tokens > 0:
+        metrics["prompt_tokens"] = round(max_prompt_tokens)
 
     # Decode roofline (only when a spec gives us the model+bandwidth facts). The
     # numbers ride into every diagnosis's metrics so the UI and remediation can
@@ -441,6 +461,62 @@ def analyze(
                 "A restart is disruptive, so ET only applies it with your approval. After "
                 "it comes back, ET measures whether tokens/sec actually improved and shows "
                 "you — if it didn't, revert to the prior flags.",
+            ],
+            metrics,
+        )
+
+    # --- Rule 3.5: PREFILL_BOUND; decode healthy, cold long-context prefill ---
+    # dominates wall time (high TTFT). The fix is prefix caching / prefill batch,
+    # NOT any decode lever — so this pre-empts the decode verdicts to avoid
+    # presenting a misleading decode diagnosis for a prefill problem.
+    decode_healthy = (
+        (rl is not None and (
+            (rl.mbu is not None and rl.mbu >= t.prefill_decode_healthy_mbu)
+            or (rl.throughput_pct is not None and rl.throughput_pct >= 0.6)
+        ))
+        or (rl is None and gen_tps > 0)
+    )
+    if (
+        llama_on
+        and max_ttft >= t.prefill_ttft_s
+        and max_prompt_tokens >= t.prefill_prompt_tokens
+        and decode_healthy
+    ):
+        metrics["prefill_bound"] = True
+        est_prefill = (
+            max_prompt_tokens / mean_prompt_tps
+            if mean_prompt_tps and mean_prompt_tps > 0
+            else None
+        )
+        if est_prefill is not None:
+            metrics["est_prefill_s"] = round(est_prefill, 1)
+        mbu_txt = f"{rl.mbu:.0%} MBU" if (rl is not None and rl.mbu is not None) else "healthy"
+        return _make(
+            Verdict.PREFILL_BOUND,
+            "warn",
+            0.8,
+            f"Decode is healthy (~{gen_tps:.0f} tok/s, {mbu_txt}) but time-to-first-"
+            f"token is ~{max_ttft:.1f}s on a ~{max_prompt_tokens:.0f}-token prompt. "
+            "This box is prefill-bound on cold long contexts: wall time is dominated "
+            "by processing the prompt, not by generation. Raising decode tok/s will "
+            "not help — the lever is prefix-cache reuse and prefill speed.",
+            [
+                f"Time-to-first-token: ~{max_ttft:.1f}s",
+                f"Prompt length: ~{max_prompt_tokens:.0f} tokens",
+                *([f"Prefill throughput: {mean_prompt_tps:.0f} tok/s"] if mean_prompt_tps else []),
+                *([f"Generation: {gen_tps:.0f} tok/s"] if gen_tps > 0 else []),
+                *([f"Decode MBU: {rl.mbu:.0%}"] if (rl is not None and rl.mbu is not None) else []),
+            ],
+            [
+                "Verify prompt caching is on (llama-server default) and enable prefix "
+                "reuse across requests with  --cache-reuse 256  so shared/repeated "
+                "prefixes skip recompute — a warm prefix cache cut a 30K-token prompt's "
+                "TTFT from ~14s to ~0.3s in the client benchmark.",
+                "Speed cold prefill with a larger prefill batch:  -b 4096 -ub 1024  "
+                "(more prompt tokens per forward pass). Watch VRAM: larger batches grow "
+                "compute buffers on a 24 GB card.",
+                "Decode is already near its ceiling — do NOT chase decode tok/s (‑ngl / "
+                "quant) here; the win is entirely in prefill and cache hit-rate.",
             ],
             metrics,
         )

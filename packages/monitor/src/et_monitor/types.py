@@ -11,6 +11,7 @@ class Verdict(str, Enum):
     IDLE_NO_REQUESTS = "idle_no_requests"
     MEMORY_HEADROOM = "memory_headroom"
     DECODE_BANDWIDTH_BOUND = "decode_bandwidth_bound"
+    PREFILL_BOUND = "prefill_bound"  # decode healthy; cold long-context prefill dominates TTFT
     GPU_OFFLOAD_PARTIAL = "gpu_offload_partial"  # layers running on CPU (-ngl too low)
     KV_CACHE_PRESSURE = "kv_cache_pressure"
     THERMAL_THROTTLE = "thermal_throttle"
@@ -24,6 +25,7 @@ VERDICT_TITLES: dict[Verdict, str] = {
     Verdict.IDLE_NO_REQUESTS: "Idle, no inference requests",
     Verdict.MEMORY_HEADROOM: "Memory under-used, room to do more",
     Verdict.DECODE_BANDWIDTH_BOUND: "Decode is memory-bandwidth bound",
+    Verdict.PREFILL_BOUND: "Prefill-bound on cold long contexts",
     Verdict.GPU_OFFLOAD_PARTIAL: "Model partly on CPU (raise -ngl)",
     Verdict.KV_CACHE_PRESSURE: "KV cache under pressure",
     Verdict.THERMAL_THROTTLE: "GPU is throttling",
@@ -55,6 +57,13 @@ class Snapshot:
     # Derived live rates (computed from counter deltas in state.py)
     gen_tokens_per_s: float | None = None
     prompt_tokens_per_s: float | None = None
+    # Prefill / prefix-cache signals for the current request (from /slots or a
+    # completion's timings; None when idle or unknown). ttft_s = time to first
+    # token (prompt-processing wall); prompt_tokens = total prompt length;
+    # cache_tokens = prompt tokens reused from the prefix cache (hit count).
+    ttft_s: float | None = None
+    prompt_tokens: float | None = None
+    cache_tokens: float | None = None
     # Static llama-server runtime config (read once from /props; None if unknown).
     # These describe HOW the server was launched, so the analyzer can attribute a
     # bottleneck to a flag (small ctx, unquantized KV, no continuous batching) and
