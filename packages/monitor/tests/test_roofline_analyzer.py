@@ -231,3 +231,28 @@ def test_prefill_bound_not_fired_when_decode_is_actually_broken():
         T, spec,
     )
     assert d.verdict == Verdict.GPU_OFFLOAD_PARTIAL
+
+
+# --- Phase 2: prefix-cache observability drives the prefill verdict ----------
+# Same client spec, but TTFT is DERIVED from /slots signals (prompt_tokens +
+# cache_tokens + prefill rate), the way production sees it — no direct ttft_s.
+
+def test_prefix_cache_cold_derives_high_ttft_and_fires_prefill_bound():
+    d = analyze(
+        _window(util_pct=52.0, gen_tokens_per_s=73.0, prompt_tokens_per_s=2140.0,
+                prompt_tokens=30000.0, cache_tokens=0.0),  # cold: no reuse
+        T, _client_spec(),
+    )
+    assert d.verdict == Verdict.PREFILL_BOUND
+    assert d.metrics["prefix_cache_hit_rate"] == 0.0
+    assert d.metrics["ttft_s"] >= 10.0  # ~30000/2140 ≈ 14s derived
+
+
+def test_prefix_cache_warm_low_ttft_is_healthy():
+    d = analyze(
+        _window(util_pct=48.0, gen_tokens_per_s=80.0, prompt_tokens_per_s=90000.0,
+                prompt_tokens=30000.0, cache_tokens=29900.0),  # warm: ~99.7% reuse
+        T, _client_spec(),
+    )
+    assert d.verdict != Verdict.PREFILL_BOUND
+    assert d.metrics["prefix_cache_hit_rate"] > 0.99

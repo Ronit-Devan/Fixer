@@ -248,8 +248,23 @@ def analyze(
     mean_conc = _mean_or(window, "requests_processing", 0.0) or 0.0
     mean_total_mb = _mean_or(window, "mem_total_mb")
     mean_prompt_tps = _mean_or(window, "prompt_tokens_per_s")
-    max_ttft = max(_vals(window, "ttft_s"), default=0.0)
+    max_prompt_tps = max(_vals(window, "prompt_tokens_per_s"), default=0.0)
     max_prompt_tokens = max(_vals(window, "prompt_tokens"), default=0.0)
+    mean_cache_tokens = _mean_or(window, "cache_tokens")
+    # Prefix-cache hit rate: fraction of the prompt reused from cache (0..1).
+    prefix_hit_rate: float | None = None
+    if max_prompt_tokens > 0 and mean_cache_tokens is not None:
+        prefix_hit_rate = max(0.0, min(1.0, mean_cache_tokens / max_prompt_tokens))
+    # TTFT: use a directly-reported value if present; else derive it from the
+    # UN-cached prompt tokens over the observed prefill rate (max prompt tok/s in
+    # the window == the real prefill throughput, robust to decode-phase ticks
+    # where prompt tok/s is ~0). A warm prefix cache shrinks TTFT toward zero.
+    direct_ttft = max(_vals(window, "ttft_s"), default=0.0)
+    est_ttft = 0.0
+    if direct_ttft <= 0 and max_prompt_tokens > 0 and max_prompt_tps > 0:
+        uncached = max_prompt_tokens * (1.0 - (prefix_hit_rate or 0.0))
+        est_ttft = uncached / max_prompt_tps
+    max_ttft = direct_ttft if direct_ttft > 0 else est_ttft
 
     # "Active" = actually serving a request. With llama metrics we know exactly
     # (requests_processing >= 1); without them we proxy from GPU utilization.
@@ -283,6 +298,9 @@ def analyze(
         metrics["ttft_s"] = round(max_ttft, 2)
     if max_prompt_tokens > 0:
         metrics["prompt_tokens"] = round(max_prompt_tokens)
+    if prefix_hit_rate is not None:
+        metrics["prefix_cache_hit_rate"] = round(prefix_hit_rate, 3)
+        metrics["prompt_tokens_cached"] = round(mean_cache_tokens or 0.0)
 
     # Decode roofline (only when a spec gives us the model+bandwidth facts). The
     # numbers ride into every diagnosis's metrics so the UI and remediation can

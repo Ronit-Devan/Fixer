@@ -365,6 +365,22 @@ class Monitor:
         # scraper (demo/custom scrapers may not implement it), so probe by attr.
         _read_props = getattr(self.llama, "read_props", None) if self.llama else None
         props: LlamaProps | None = _read_props() if _read_props else None
+        # Prefix-cache reuse + prompt length from /slots (current llama.cpp
+        # dropped the /metrics KV counters). Box-level, read once per tick; the
+        # scraper stops polling if the build lacks /slots. Demo/custom scrapers
+        # may not implement it, so probe by attribute.
+        _read_slots = getattr(self.llama, "read_slots", None) if self.llama else None
+        slots = _read_slots() if _read_slots else None
+        slot_prompt_tokens = (
+            float(slots.prompt_tokens)
+            if slots is not None and slots.prompt_tokens
+            else None
+        )
+        slot_cache_tokens = (
+            float(slots.cache_tokens)
+            if slots is not None and slots.cache_tokens is not None
+            else None
+        )
         gen_tps = prompt_tps = None
         if lm is not None and self._prev_llama is not None:
             ldt = lm.timestamp_s - self._prev_llama.timestamp_s
@@ -404,6 +420,8 @@ class Monitor:
                 kv_cache_usage_ratio=lm.kv_cache_usage_ratio if lm else None,
                 gen_tokens_per_s=gen_tps,
                 prompt_tokens_per_s=prompt_tps,
+                prompt_tokens=slot_prompt_tokens,
+                cache_tokens=slot_cache_tokens,
                 ctx_size=props.ctx_size if props else None,
                 total_slots=props.total_slots if props else None,
                 cache_type_k=props.cache_type_k if props else None,

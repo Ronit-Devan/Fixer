@@ -77,6 +77,70 @@ class LlamaProps:
     n_gpu_layers: int | None = None
 
 
+@dataclass(frozen=True)
+class SlotsInfo:
+    """Aggregated ``/slots`` state — the prefix-cache reuse signal.
+
+    Current llama.cpp no longer exposes KV/prefix counters on ``/metrics`` (the
+    old ``kv_cache_usage_ratio``/``kv_cache_tokens`` were removed), so prefix
+    reuse must come from ``/slots``: per request, ``n_prompt_tokens`` is the full
+    prompt, ``n_prompt_tokens_cache`` is how many were reused from the cache, and
+    ``n_prompt_tokens_processed`` is the part actually (re)computed. We summarise
+    the busiest slot (largest prompt), which is the long-context request whose
+    cold/warm prefill dominates TTFT.
+    """
+
+    reachable: bool = False
+    n_slots: int = 0
+    processing: int = 0
+    prompt_tokens: int | None = None
+    cache_tokens: int | None = None
+    prompt_tokens_processed: int | None = None
+    n_ctx: int | None = None
+    speculative: bool = False
+
+    @property
+    def prefix_hit_rate(self) -> float | None:
+        """Fraction of the prompt served from the prefix cache (0..1), or None."""
+        if not self.prompt_tokens or self.prompt_tokens <= 0:
+            return None
+        return max(0.0, min(1.0, (self.cache_tokens or 0) / self.prompt_tokens))
+
+
+def slots_from_json(obj: object) -> SlotsInfo:
+    """Parse a ``/slots`` array (best-effort; unknown shape -> unreachable)."""
+    if not isinstance(obj, list) or not obj:
+        return SlotsInfo(reachable=isinstance(obj, list))
+    slots = [s for s in obj if isinstance(s, dict)]
+    if not slots:
+        return SlotsInfo(reachable=True)
+
+    def _int(v):
+        return int(v) if isinstance(v, (int, float)) else None
+
+    processing = sum(1 for s in slots if s.get("is_processing"))
+    speculative = any(bool(s.get("speculative")) for s in slots)
+    n_ctx = next((_int(s.get("n_ctx")) for s in slots if s.get("n_ctx") is not None), None)
+    # Summarise the slot with the largest prompt (the long-context request whose
+    # prefill matters); prefer a currently-processing one.
+    ranked = sorted(
+        slots,
+        key=lambda s: (bool(s.get("is_processing")), _int(s.get("n_prompt_tokens")) or 0),
+        reverse=True,
+    )
+    top = ranked[0]
+    return SlotsInfo(
+        reachable=True,
+        n_slots=len(slots),
+        processing=processing,
+        prompt_tokens=_int(top.get("n_prompt_tokens")),
+        cache_tokens=_int(top.get("n_prompt_tokens_cache")),
+        prompt_tokens_processed=_int(top.get("n_prompt_tokens_processed")),
+        n_ctx=n_ctx,
+        speculative=speculative,
+    )
+
+
 def _dig(d: dict, *keys):
     """First present, non-None value among top-level or nested ``keys``.
 
@@ -165,10 +229,13 @@ class LlamaScraper:
         self.base_url = base_url.rstrip("/")
         self.metrics_url = f"{self.base_url}/metrics"
         self.props_url = f"{self.base_url}/props"
+        self.slots_url = f"{self.base_url}/slots"
         self.timeout_s = timeout_s
         self._warned_unreachable = False
         self._props: LlamaProps | None = None  # cached after the first success
         self._props_attempts = 0  # bound failing /props polls so we don't hammer it
+        self._slots_failures = 0  # stop polling /slots if the build lacks it
+        self._slots_disabled = False
 
     def read(self) -> LlamaMetrics | None:
         now = time.time()
@@ -194,6 +261,27 @@ class LlamaScraper:
         if not raw:
             return None
         return metrics_from_raw(raw, timestamp_s=now)
+
+    def read_slots(self, *, max_failures: int = 3) -> SlotsInfo | None:
+        """Poll ``/slots`` for the prefix-cache reuse signal. Cheap (a few slots).
+
+        Returns None when unreachable. After ``max_failures`` consecutive misses
+        (e.g. a build with ``--slots`` disabled, which 501s), stops issuing calls
+        so a missing endpoint never costs a request every tick.
+        """
+        if self._slots_disabled:
+            return None
+        try:
+            req = urllib.request.Request(self.slots_url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                obj = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError):
+            self._slots_failures += 1
+            if self._slots_failures >= max_failures:
+                self._slots_disabled = True
+            return None
+        self._slots_failures = 0
+        return slots_from_json(obj)
 
     def read_props(self, *, refresh: bool = False, max_attempts: int = 3) -> LlamaProps:
         """One-shot read of ``/props`` (server launch config), cached.
