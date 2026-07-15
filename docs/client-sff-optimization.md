@@ -13,6 +13,7 @@ serving stream. Model + quant are **immutable**; every default here is
 | **Decode roofline** | `bandwidth / full-GGUF-bytes` — for an MoE this overstates bytes/token ~10× → MBU > 1, absurd ceilings | MoE-aware: reads `<arch>.expert_count`/`expert_used_count`, sums routed-expert (`*_exps`) vs always-active tensor bytes via data-offset deltas → **active-bytes-per-token** ceiling. Dense unchanged; any unreadable tensor block degrades to full-weight |
 | **Prefill vs decode** | End-to-end tok/s could read as "decode" | Decode tok/s kept strictly separate; TTFT + prefill tok/s surfaced; new **PREFILL_BOUND** verdict fires on cold long contexts (high TTFT + healthy decode) and recommends prefix caching, never a decode lever |
 | **Prefix cache** | Relied on removed `/metrics` KV counters | Reads `/slots` (`n_prompt_tokens`, `n_prompt_tokens_cache`) → prefix-cache **hit rate**; TTFT derived from uncached tokens ÷ observed prefill rate |
+| **KV VRAM budget** | none | Reads GQA attention keys from GGUF → KV bytes/token; `WorkloadSpec.vram_fit(ctx)` reports weights+KV vs the 24 GB budget (predictive saturation), and the actuator **refuses a flag set that would OOM** before proposing it |
 | **KV-cache quant** | `--cache-type-k/v q8_0` in the **default** restart flags (quality-affecting!) | **Opt-in only** (`kv_quant`/explicit knob); never in the lossless default set |
 | **Prefill/TTFT lever** | none | `--cache-reuse 256` (output-lossless prefix-KV reuse) on by default; `-b` prefill-batch knob |
 | **70 W thermals** | Power-limit fix hard-assumed a **300 W** base → proposed ~345 W on any card | Sizes the raise off the card's **real** current limit, clamps to its known max, and **refuses (advise cooling) when a card is already at its cap** — a 70 W SFF never gets a nonsense over-cap limit |
@@ -40,20 +41,24 @@ make requests **warm** (prefix cache), where e2e is ~76–80 and decode, not pre
 is the (physical) limit. We do not degrade quality to fake this number.
 
 ## Verification
-531 tests pass (remediation 138, monitor 133, engine 140, agent 111, web/api 9);
+539 tests pass (remediation 142, monitor 137, engine 140, agent 111, web/api 9);
 ruff + mypy clean on touched packages; adversarial pass (missing/garbage GGUF,
 unknown GPU, no-bandwidth spec, partial offload, MoE-fallback) all degrade
 gracefully with no exceptions. Four client scenarios are encoded as analyzer
 tests asserting the correct verdict for each.
 
-## Deferred / not done (honest)
-- **KV-budget from GGUF** (Phase 2b): computing KV bytes from `head_count_kv` ×
-  `embedding_length` × `n_layers` × ctx and reporting occupancy vs the 24 GB
-  budget + a predictive KV-saturation warning. Not implemented; the prefix-cache
-  hit-rate observability (Phase 2a) landed.
-- **Holistic VRAM-budget validator** for a generated flag set before proposal.
-  Per-lever VRAM gates exist (`-ngl`, `-ub`, spec-decode draft); a single
-  pre-proposal budget check does not.
+## Scope delivered
+All four phases are implemented and tested:
+- **Phase 1** — SFF bandwidth fix, MoE-aware roofline, prefill-bound verdict.
+- **Phase 2** — prefix-cache observability from `/slots` (2a) **and** KV-cache
+  VRAM budget from GGUF with predictive saturation (2b).
+- **Phase 3** — quality-lossless tuned config (opt-in KV-quant, `--cache-reuse`,
+  prefill batch), 70 W thermal sanity, and a VRAM-budget validator that refuses
+  an OOM flag set before it can be proposed.
+- **Phase 4** — full cross-package verification + this report.
+
+Remaining as advisory-only by design (never auto-applied): speculative decoding
+(needs a draft-model artifact) and KV-cache quantization (quality-affecting).
 
 ## Open questions for the client
 1. **Exact model + quant** (name + GGUF)? Physics say it's an MoE with ~3B active,
