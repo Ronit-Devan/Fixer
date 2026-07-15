@@ -256,3 +256,37 @@ def test_prefix_cache_warm_low_ttft_is_healthy():
     )
     assert d.verdict != Verdict.PREFILL_BOUND
     assert d.metrics["prefix_cache_hit_rate"] > 0.99
+
+
+# --- Live-traffic (bursty) robustness for the prefill verdict ----------------
+# Real demo/production traffic is one request at a time with idle gaps: the
+# window MEAN of gen tok/s dilutes toward zero between requests. Decode health
+# must be judged on the PEAK tick rate or the verdict never fires live.
+
+def test_prefill_bound_fires_on_bursty_single_request_traffic():
+    idle = [_snap(util_pct=3.0, requests_processing=0.0, gen_tokens_per_s=0.0,
+                  prompt_tokens_per_s=0.0) for _ in range(18)]
+    prefill = [_snap(util_pct=90.0, requests_processing=1.0, gen_tokens_per_s=0.0,
+                     prompt_tokens_per_s=6000.0, prompt_tokens=30000.0,
+                     cache_tokens=0.0) for _ in range(5)]
+    decode = [_snap(util_pct=55.0, requests_processing=1.0, gen_tokens_per_s=120.0,
+                    prompt_tokens_per_s=0.0, prompt_tokens=30000.0,
+                    cache_tokens=0.0) for _ in range(4)]
+    d = analyze(idle + prefill + decode, T, _client_spec())
+    # Mean gen ~18 tok/s (diluted) but peak is 120 -> decode is healthy ->
+    # the 30K cold prefill must be diagnosed as PREFILL_BOUND, not masked.
+    assert d.verdict == Verdict.PREFILL_BOUND
+    assert d.metrics["ttft_s"] >= 2.0  # 30000/6000 = 5s derived
+
+
+def test_warm_request_after_cold_is_not_prefill_bound():
+    # After the /slots stale-data gating, a warm request's window carries ONLY
+    # its own facts: full prompt, near-full cache hit, tiny processed rate.
+    idle = [_snap(util_pct=3.0, requests_processing=0.0, gen_tokens_per_s=0.0,
+                  prompt_tokens_per_s=0.0) for _ in range(20)]
+    warm = [_snap(util_pct=55.0, requests_processing=1.0, gen_tokens_per_s=120.0,
+                  prompt_tokens_per_s=10.0, prompt_tokens=30000.0,
+                  cache_tokens=29990.0) for _ in range(4)]
+    d = analyze(idle + warm, T, _client_spec())
+    assert d.verdict != Verdict.PREFILL_BOUND
+    assert d.metrics["prefix_cache_hit_rate"] > 0.99

@@ -487,13 +487,20 @@ def analyze(
     # dominates wall time (high TTFT). The fix is prefix caching / prefill batch,
     # NOT any decode lever — so this pre-empts the decode verdicts to avoid
     # presenting a misleading decode diagnosis for a prefill problem.
-    decode_healthy = (
-        (rl is not None and (
-            (rl.mbu is not None and rl.mbu >= t.prefill_decode_healthy_mbu)
-            or (rl.throughput_pct is not None and rl.throughput_pct >= 0.6)
-        ))
-        or (rl is None and gen_tps > 0)
-    )
+    #
+    # Decode health is judged on the PEAK per-tick generation rate, not the
+    # window mean: real traffic is bursty (a request decodes for a few seconds,
+    # then the box idles), so the mean dilutes toward zero between requests and
+    # would mask a perfectly healthy decoder. Peak == mean under sustained load,
+    # so steady-serving behaviour is unchanged.
+    peak_gen = max(_vals(window, "gen_tokens_per_s"), default=0.0)
+    ideal = rl.ideal_tok_s if rl is not None else None
+    if ideal:
+        decode_healthy = (peak_gen / ideal) >= t.prefill_decode_healthy_mbu
+    else:
+        # No roofline (no spec / no bandwidth): any observed decoding counts as
+        # healthy — the prefill diagnosis doesn't need the decode ceiling.
+        decode_healthy = peak_gen > 0
     if (
         llama_on
         and max_ttft >= t.prefill_ttft_s
@@ -501,29 +508,29 @@ def analyze(
         and decode_healthy
     ):
         metrics["prefill_bound"] = True
+        # Peak prefill rate, not the window mean: bursty windows dilute the mean
+        # with idle/decode ticks, but the max tick rate IS the real prefill speed.
         est_prefill = (
-            max_prompt_tokens / mean_prompt_tps
-            if mean_prompt_tps and mean_prompt_tps > 0
-            else None
+            max_prompt_tokens / max_prompt_tps if max_prompt_tps > 0 else None
         )
         if est_prefill is not None:
             metrics["est_prefill_s"] = round(est_prefill, 1)
-        mbu_txt = f"{rl.mbu:.0%} MBU" if (rl is not None and rl.mbu is not None) else "healthy"
+        peak_mbu_txt = f"{peak_gen / ideal:.0%} of ceiling" if ideal else "healthy"
         return _make(
             Verdict.PREFILL_BOUND,
             "warn",
             0.8,
-            f"Decode is healthy (~{gen_tps:.0f} tok/s, {mbu_txt}) but time-to-first-"
-            f"token is ~{max_ttft:.1f}s on a ~{max_prompt_tokens:.0f}-token prompt. "
+            f"Decode is healthy (~{peak_gen:.0f} tok/s while generating, {peak_mbu_txt}) "
+            f"but time-to-first-token is ~{max_ttft:.1f}s on a "
+            f"~{max_prompt_tokens:.0f}-token prompt. "
             "This box is prefill-bound on cold long contexts: wall time is dominated "
             "by processing the prompt, not by generation. Raising decode tok/s will "
             "not help — the lever is prefix-cache reuse and prefill speed.",
             [
                 f"Time-to-first-token: ~{max_ttft:.1f}s",
                 f"Prompt length: ~{max_prompt_tokens:.0f} tokens",
-                *([f"Prefill throughput: {mean_prompt_tps:.0f} tok/s"] if mean_prompt_tps else []),
-                *([f"Generation: {gen_tps:.0f} tok/s"] if gen_tps > 0 else []),
-                *([f"Decode MBU: {rl.mbu:.0%}"] if (rl is not None and rl.mbu is not None) else []),
+                *([f"Prefill throughput: {max_prompt_tps:.0f} tok/s"] if max_prompt_tps > 0 else []),
+                *([f"Generation (peak): {peak_gen:.0f} tok/s"] if peak_gen > 0 else []),
             ],
             [
                 "Verify prompt caching is on (llama-server default) and enable prefix "

@@ -371,16 +371,18 @@ class Monitor:
         # may not implement it, so probe by attribute.
         _read_slots = getattr(self.llama, "read_slots", None) if self.llama else None
         slots = _read_slots() if _read_slots else None
-        slot_prompt_tokens = (
-            float(slots.prompt_tokens)
-            if slots is not None and slots.prompt_tokens
-            else None
-        )
-        slot_cache_tokens = (
-            float(slots.cache_tokens)
-            if slots is not None and slots.cache_tokens is not None
-            else None
-        )
+        # Only carry prompt/cache facts while a request is actually PROCESSING:
+        # /slots keeps reporting the last finished task (task_prev), and letting
+        # that stale data ride into idle ticks poisons the analyzer's window —
+        # e.g. a warm request right after a cold one would mix the cold request's
+        # zero-cache stats into its window and false-positive the prefill verdict.
+        slot_prompt_tokens: float | None = None
+        slot_cache_tokens: float | None = None
+        if slots is not None and slots.processing > 0:
+            if slots.prompt_tokens:
+                slot_prompt_tokens = float(slots.prompt_tokens)
+            if slots.cache_tokens is not None:
+                slot_cache_tokens = float(slots.cache_tokens)
         gen_tps = prompt_tps = None
         if lm is not None and self._prev_llama is not None:
             ldt = lm.timestamp_s - self._prev_llama.timestamp_s
