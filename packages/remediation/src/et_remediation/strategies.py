@@ -59,17 +59,36 @@ def _worker_pid(ctx: ActionContext) -> int | None:
 
 
 def _build_power_limit(ctx: ActionContext) -> dict:
-    # Raise the enforced power limit toward the card's cap by a headroom factor.
-    # Falls back to a sane default target if we can't read the current limit.
-    cur = ctx.knobs.get("current_power_limit_w") or ctx.metrics.get("power_limit_w")
+    """Raise the enforced power limit so the SM clock can recover from a POWER cap.
+
+    70W-SFF safety: the old code hard-assumed a 300W base and would propose a
+    ~345W target on ANY card — nonsense for a 70W SFF, whose throttle is thermal,
+    not power. Now we base the raise on the card's REAL current limit and clamp to
+    its known maximum; when the card is already at/near that maximum (a maxed-out
+    small card) we refuse, so the thermal verdict's cooling advice stands instead
+    of a nonsense over-cap limit. The nominal 300W base is a last resort used only
+    when there is no power telemetry at all, and it is still clamped by any known
+    cap. Production should supply the current limit + NVML max for the SFF.
+    """
+    cur_raw = ctx.knobs.get("current_power_limit_w") or ctx.metrics.get("power_limit_w")
+    cur = float(cur_raw) if cur_raw is not None else None
+    cap_raw = ctx.knobs.get("max_power_limit_w") or ctx.metrics.get("power_limit_max_w")
+    cap = float(cap_raw) if cap_raw is not None else None
     target = ctx.knobs.get("target_power_w")
     if target is None:
         headroom = float(ctx.knobs.get("power_headroom_pct", 15.0)) / 100.0
-        base = float(cur) if cur else 300.0
-        cap = float(ctx.knobs.get("max_power_limit_w", base * (1 + headroom)))
-        target = min(base * (1 + headroom), cap)
-    prior = {"power_limit_w": float(cur)} if cur else {}
-    return {"power_limit_w": int(round(float(target))), "prior": prior}
+        base = cur if cur is not None else float(ctx.knobs.get("fallback_power_w", 300.0))
+        target = base * (1 + headroom)
+    target = float(target)
+    if cap is not None:
+        target = min(target, cap)
+    if cap is not None and cur is not None and target <= cur + 1.0:
+        raise ValueError(
+            f"power limit {cur:.0f}W already at/near the card cap ({cap:.0f}W); "
+            "raising won't relieve throttle (thermal, not power) — advise cooling"
+        )
+    prior = {"power_limit_w": cur} if cur is not None else {}
+    return {"power_limit_w": int(round(target)), "prior": prior}
 
 
 def _build_kill_orphan(ctx: ActionContext) -> dict:
@@ -166,26 +185,38 @@ def _build_restart_llama(ctx: ActionContext) -> dict:
     else:
         params["n_gpu_layers"] = int(k.get("n_gpu_layers", k.get("model_n_layers", 999)))
 
-    # KV cache: quantize only if it isn't already (avoid needless quality changes).
-    if str(k.get("current_cache_type_k", "")).lower() not in _QUANTIZED_KV:
+    # KV-cache quantization CAN change outputs, so it is OPT-IN only and NEVER in
+    # the default flag set — the default recommendation must be quality-lossless.
+    # Set it only when the operator explicitly asks (kv_quant truthy, or an
+    # explicit cache_type_* knob) AND the cache isn't already quantized.
+    kv_opt_in = bool(k.get("kv_quant") or k.get("cache_type_k") or k.get("cache_type_v"))
+    already_quant = str(k.get("current_cache_type_k", "")).lower() in _QUANTIZED_KV
+    if kv_opt_in and not already_quant:
         params["cache_type_k"] = k.get("cache_type_k", "q8_0")
         params["cache_type_v"] = k.get("cache_type_v", "q8_0")
 
     if k.get("mlock", True):
         params["mlock"] = True
 
-    # Flash attention: smaller KV footprint per token and a prerequisite for the
-    # KV-cache quantization set above (q8_0 K/V needs flash-attn). Rendered with an
+    # Flash attention is OUTPUT-LOSSLESS: it reduces KV memory bandwidth (and is a
+    # prerequisite IF the operator opts into quantized KV). Rendered with an
     # explicit value because current llama.cpp's -fa flag takes [on|off|auto].
     # Default ON unless the operator explicitly disabled it.
     fa = k.get("flash_attn", True)
     if fa is not False:
         params["flash_attn"] = "on" if fa is True else fa
 
-    # Micro-batch size primarily speeds up PREFILL (prompt ingestion), not
-    # single-stream decode, and a larger ubatch grows the compute buffers (more
-    # VRAM). So only raise it when there is clear VRAM headroom; otherwise leave
-    # llama.cpp's default. This keeps the restart from OOMing a near-full card.
+    # Prefix-cache reuse (--cache-reuse N): reuse KV for matching prompt prefixes
+    # via KV-shifting, cutting cold long-context TTFT — the client's actual
+    # bottleneck. Output-lossless (same tokens, skips recompute), so safe to
+    # enable by default. Requires prompt caching (on by default in llama-server).
+    params["cache_reuse"] = int(k.get("cache_reuse", 256))
+
+    # Prefill batch: a larger logical/physical batch ingests more prompt tokens
+    # per forward pass -> lower cold TTFT. Output-lossless. -b is knob-gated
+    # (VRAM), -ub auto-raised only with clear VRAM headroom.
+    if k.get("batch_size") is not None:
+        params["batch_size"] = int(k["batch_size"])
     ubatch = k.get("ubatch_size")
     if ubatch is not None:
         params["ubatch_size"] = int(ubatch)

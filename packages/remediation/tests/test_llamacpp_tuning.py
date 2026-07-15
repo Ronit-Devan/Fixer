@@ -18,7 +18,12 @@ from et_remediation import (
 from et_remediation.actions import ActionContext, ActionKind, ActionRequest, ProtectedWorkload
 from et_remediation.actuators.base import CommandRunner
 from et_remediation.rootcause import RootCause, map_monitor_verdict
-from et_remediation.strategies import _build_fix_offload, _build_restart_llama, _build_spec_decode
+from et_remediation.strategies import (
+    _build_fix_offload,
+    _build_power_limit,
+    _build_restart_llama,
+    _build_spec_decode,
+)
 from et_remediation.telemetry import summarize
 from et_remediation.verify import throughput_recovered
 
@@ -330,3 +335,60 @@ def test_actuator_renders_spec_decode_with_draft_gpu_layers():
     assert "--draft 16" in s
     assert "-ngld 999" in s  # draft model offloaded to GPU, not stranded on CPU
     assert "--flash-attn on" in s
+
+
+# -- Phase 3: quality-lossless defaults, prefix reuse, 70W thermal sanity -----
+
+
+def test_restart_default_is_quality_lossless_no_kv_quant():
+    # KV-cache quant CAN change outputs -> must NOT be in the default flag set.
+    p = _build_restart_llama(_ctx(metrics={"mem_used_ratio": 0.5}))
+    assert "cache_type_k" not in p and "cache_type_v" not in p
+    # But output-lossless levers ARE on by default: full offload, flash-attn,
+    # and prefix-cache reuse (the client's cold-TTFT lever).
+    assert p.get("flash_attn") == "on"
+    assert p.get("cache_reuse") == 256
+
+
+def test_restart_kv_quant_only_when_opted_in():
+    p = _build_restart_llama(_ctx(metrics={"mem_used_ratio": 0.5}, knobs={"kv_quant": True}))
+    assert p["cache_type_k"] == "q8_0" and p["cache_type_v"] == "q8_0"
+    # Explicit cache type also opts in.
+    p2 = _build_restart_llama(_ctx(metrics={"mem_used_ratio": 0.5}, knobs={"cache_type_k": "q4_0"}))
+    assert p2["cache_type_k"] == "q4_0"
+
+
+def test_restart_cache_reuse_and_prefill_batch_knobs():
+    p = _build_restart_llama(_ctx(metrics={"mem_used_ratio": 0.5},
+                                   knobs={"cache_reuse": 512, "batch_size": 4096}))
+    assert p["cache_reuse"] == 512
+    assert p["batch_size"] == 4096
+
+
+def test_actuator_renders_cache_reuse():
+    act = LlamaCppActuator(CommandRunner(execute=False))
+    req = ActionRequest(
+        kind=ActionKind.RESTART_LLAMA_SERVER, action_class=None, node_id="n", target="0",
+        params={"model": "m.gguf", "cache_reuse": 256, "batch_size": 4096},
+    )
+    s = " ".join(act.build_argv(req))
+    assert "--cache-reuse 256" in s and "-b 4096" in s
+
+
+def test_power_limit_refuses_raise_on_maxed_small_card():
+    # 70W SFF already at its 70W cap: raising can't help (thermal) -> refuse.
+    import pytest
+    with pytest.raises(ValueError, match="cooling"):
+        _build_power_limit(_ctx(metrics={"power_limit_w": 70.0, "power_limit_max_w": 70.0}))
+
+
+def test_power_limit_raises_when_real_headroom_below_cap():
+    p = _build_power_limit(_ctx(metrics={"power_limit_w": 300.0, "power_limit_max_w": 400.0}))
+    assert p["power_limit_w"] == 345  # 300 * 1.15, under the 400 cap
+
+
+def test_power_limit_bases_on_real_current_not_a_fixed_300():
+    # With the card's real (small) current limit known, the raise is sized off
+    # IT, not a fabricated 300W desktop base.
+    p = _build_power_limit(_ctx(metrics={"power_limit_w": 70.0}))
+    assert p["power_limit_w"] == 80  # 70 * 1.15, not ~345
