@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import signal
-import sys
 import time
 from pathlib import Path
 from typing import Annotated, Callable
@@ -490,4 +489,6 @@ def main() -> None:  # pragma: no cover - thin wrapper
 
 
 if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+    # main() returns None (typer's app() raises SystemExit with the real exit
+    # code itself); sys.exit(main()) was just passing None along for no effect.
+    main()
