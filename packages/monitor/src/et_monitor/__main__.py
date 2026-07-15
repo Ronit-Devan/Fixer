@@ -174,10 +174,12 @@ def _resolve_workload_spec(args: argparse.Namespace, gpu, llama) -> WorkloadSpec
         return None  # no server to introspect -> can't build a roofline unattended
 
     gpu_name = None
+    gpu_mem_total_mb = None
     if getattr(gpu, "backend", "") != "mock":
         try:
             readings = gpu.read()
             gpu_name = readings[0].name if readings else None
+            gpu_mem_total_mb = readings[0].mem_total_mb if readings else None
         except Exception:  # noqa: BLE001
             gpu_name = None
     try:
@@ -187,6 +189,7 @@ def _resolve_workload_spec(args: argparse.Namespace, gpu, llama) -> WorkloadSpec
             model_path=args.model or None,
             n_gpu_layers=args.ngl,
             mem_bandwidth_gb_s=args.gpu_bandwidth,
+            gpu_mem_total_mb=gpu_mem_total_mb,
         )
     except Exception:  # noqa: BLE001 — detection is best-effort, never fatal
         return None

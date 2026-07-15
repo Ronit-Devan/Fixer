@@ -281,3 +281,56 @@ def test_roofline_moe_ceiling_uses_active_bytes():
     assert rl is not None and rl.is_moe is True
     assert 100 < rl.ideal_tok_s < 115  # 432e9/4e9 = 108
     assert rl.mbu is not None and 0.7 < rl.mbu < 0.95  # healthy, not absurd >1
+
+
+# -- KV-cache budget from GGUF (weights + KV must fit 24 GB) ------------------
+
+
+def test_kv_bytes_per_token_from_gguf_attention_keys(tmp_path):
+    # 48 layers, 8 KV heads (GQA), n_embd 4096, 32 query heads -> head_dim 128.
+    # kv/token = 2 * 48 * 8 * 128 * 2 bytes = 196608 bytes.
+    kvs = [
+        ("general.architecture", 8, _gguf_string("qwen3moe")),
+        ("qwen3moe.block_count", 4, struct.pack("<I", 48)),
+        ("qwen3moe.attention.head_count_kv", 4, struct.pack("<I", 8)),
+        ("qwen3moe.attention.head_count", 4, struct.pack("<I", 32)),
+        ("qwen3moe.embedding_length", 4, struct.pack("<I", 4096)),
+        ("qwen3moe.context_length", 4, struct.pack("<I", 32768)),
+    ]
+    p = tmp_path / "kv.gguf"
+    p.write_bytes(_make_gguf_with_tensors(kvs, [("token_embd.weight", 1000)]))
+    info = read_gguf_metadata(p)
+    assert info is not None
+    assert info.n_head_kv == 8 and info.n_head == 32 and info.n_embd == 4096
+    assert info.context_length == 32768
+    assert info.kv_bytes_per_token() == 2 * 48 * 8 * 128 * 2  # 196608
+
+
+def test_kv_bytes_none_when_attention_keys_missing(tmp_path):
+    kvs = [
+        ("general.architecture", 8, _gguf_string("llama")),
+        ("llama.block_count", 4, struct.pack("<I", 32)),
+    ]
+    p = tmp_path / "nokv.gguf"
+    p.write_bytes(_make_gguf_with_tensors(kvs, [("token_embd.weight", 1000)]))
+    info = read_gguf_metadata(p)
+    assert info is not None and info.kv_bytes_per_token() is None
+
+
+def test_vram_fit_budget_math():
+    # Client shape: ~18 GB weights, ~196 KB/token KV, 24 GB card.
+    spec = WorkloadSpec(
+        model_bytes=18e9, kv_bytes_per_token=196608.0, mem_total_bytes=24e9,
+        n_layers=48, n_gpu_layers=999, mem_bandwidth_gb_s=432.0,
+    )
+    fit = spec.vram_fit(30000)
+    assert fit is not None
+    # KV @ 30K = 196608 * 30000 ≈ 5.9 GB; weights 18 + 5.9 + 0.6 ≈ 24.5 GB > 24 -> tight/overflow
+    assert fit["kv_gb"] > 5.0
+    assert fit["fits"] is False  # 30K context does NOT fit alongside 18 GB weights
+    # A shorter context fits with headroom.
+    assert spec.vram_fit(8000)["fits"] is True
+
+
+def test_vram_fit_none_without_facts():
+    assert WorkloadSpec(model_bytes=18e9).vram_fit(30000) is None  # no kv/mem facts

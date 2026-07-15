@@ -151,6 +151,11 @@ class GgufInfo:
     # MoE facts: total routed experts and how many fire per token.
     expert_count: int | None = None  # <arch>.expert_count
     expert_used_count: int | None = None  # <arch>.expert_used_count
+    # KV-cache sizing facts (for the VRAM budget: weights + KV must fit 24 GB).
+    n_head_kv: int | None = None  # <arch>.attention.head_count_kv
+    n_head: int | None = None  # <arch>.attention.head_count
+    n_embd: int | None = None  # <arch>.embedding_length
+    context_length: int | None = None  # <arch>.context_length (trained max ctx)
     # Bytes actually READ per decode token. For a dense model this equals the
     # full weight bytes; for an MoE only expert_used_count/expert_count of the
     # routed-expert weights are read, so this is far smaller than file_bytes.
@@ -164,6 +169,19 @@ class GgufInfo:
             and self.expert_used_count
             and 0 < self.expert_used_count < self.expert_count
         )
+
+    def kv_bytes_per_token(self, dtype_bytes: float = 2.0) -> float | None:
+        """Bytes of KV cache one token occupies (K+V), f16 by default.
+
+        2 (K and V) x n_layers x n_head_kv x head_dim x dtype_bytes, with
+        head_dim = embedding_length / n_head. None if any factor is unknown.
+        Grouped-query attention makes n_head_kv << n_head, so this uses the KV
+        head count, not the query head count.
+        """
+        if not (self.n_layers and self.n_head_kv and self.n_embd and self.n_head):
+            return None
+        head_dim = self.n_embd / self.n_head
+        return 2.0 * self.n_layers * self.n_head_kv * head_dim * dtype_bytes
 
 
 def _read_gguf_string(f) -> str:
@@ -279,6 +297,10 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
             param_count: int | None = None
             expert_count: int | None = None
             expert_used: int | None = None
+            n_head_kv: int | None = None
+            n_head: int | None = None
+            n_embd: int | None = None
+            context_length: int | None = None
             alignment = 32  # GGUF default; overridden by general.alignment if set
 
             # Read EVERY kv (no early exit): we need expert_count/alignment which
@@ -293,6 +315,10 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                     key.endswith(".block_count")
                     or key.endswith(".expert_count")
                     or key.endswith(".expert_used_count")
+                    or key.endswith(".attention.head_count_kv")
+                    or key.endswith(".attention.head_count")
+                    or key.endswith(".embedding_length")
+                    or key.endswith(".context_length")
                     or key == "general.parameter_count"
                     or key == "general.alignment"
                 ):
@@ -304,6 +330,14 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                         expert_used = int(val)
                     elif key.endswith(".expert_count"):
                         expert_count = int(val)
+                    elif key.endswith(".attention.head_count_kv"):
+                        n_head_kv = int(val)
+                    elif key.endswith(".attention.head_count"):
+                        n_head = int(val)
+                    elif key.endswith(".embedding_length"):
+                        n_embd = int(val)
+                    elif key.endswith(".context_length"):
+                        context_length = int(val)
                     elif key == "general.parameter_count":
                         param_count = int(val)
                     elif key == "general.alignment":
@@ -348,6 +382,10 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                 expert_count=expert_count,
                 expert_used_count=expert_used,
                 active_bytes=active_bytes,
+                n_head_kv=n_head_kv,
+                n_head=n_head,
+                n_embd=n_embd,
+                context_length=context_length,
             )
     except (OSError, struct.error, ValueError, MemoryError, OverflowError):
         return None
@@ -370,6 +408,8 @@ class WorkloadSpec:
     # model_bytes (only active experts stream); None/absent => dense, use full
     # model_bytes. This is what makes the decode ceiling correct on an MoE.
     active_bytes: float | None = None
+    kv_bytes_per_token: float | None = None  # KV cache one token occupies (f16)
+    mem_total_bytes: float | None = None  # GPU VRAM budget (for weights + KV fit)
     n_layers: int | None = None
     n_gpu_layers: int | None = None  # configured -ngl; None/<0 => treat as all
     mem_bandwidth_gb_s: float | None = None
@@ -396,6 +436,27 @@ class WorkloadSpec:
     @property
     def has_roofline(self) -> bool:
         return bool(self.model_bytes and self.mem_bandwidth_gb_s)
+
+    def vram_fit(self, ctx: int, *, kv_dtype_bytes: float = 2.0, overhead_bytes: float = 6e8) -> dict | None:
+        """Does model (ALL weights resident — every MoE expert too) + KV(ctx) fit
+        in VRAM? Returns GB breakdown + headroom + fits, or None if unknown.
+
+        KV grows linearly with context, so this is the predictive saturation
+        check: weights + 30K-context KV on 24 GB is what the client runs near.
+        """
+        if not (self.model_bytes and self.kv_bytes_per_token and self.mem_total_bytes and ctx > 0):
+            return None
+        kv = self.kv_bytes_per_token * ctx
+        used = self.model_bytes + kv + overhead_bytes
+        return {
+            "weights_gb": round(self.model_bytes / 1e9, 2),
+            "kv_gb": round(kv / 1e9, 2),
+            "overhead_gb": round(overhead_bytes / 1e9, 2),
+            "used_gb": round(used / 1e9, 2),
+            "total_gb": round(self.mem_total_bytes / 1e9, 2),
+            "headroom_gb": round((self.mem_total_bytes - used) / 1e9, 2),
+            "fits": used <= self.mem_total_bytes,
+        }
 
     def bytes_on_gpu(self) -> float | None:
         """Bytes read from GPU per decode token, scaled by offload fraction.

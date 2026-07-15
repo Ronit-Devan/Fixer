@@ -56,6 +56,7 @@ def build_workload_spec(
     model_path: str | None = None,
     n_gpu_layers: int | None = None,
     mem_bandwidth_gb_s: float | None = None,
+    gpu_mem_total_mb: float | None = None,
     timeout_s: float = 2.0,
 ) -> tuple[WorkloadSpec, list[str]]:
     """Assemble a WorkloadSpec from whatever the box exposes. Returns (spec, notes)
@@ -79,12 +80,16 @@ def build_workload_spec(
 
     # 2) Read the GGUF header for layer count + size (the roofline's denominator).
     active_bytes: float | None = None
+    kv_bytes_per_token: float | None = None
+    context_length: int | None = None
     if model_path and Path(model_path).is_file():
         info = read_gguf_metadata(model_path)
         if info is not None:
             model_bytes = float(info.file_bytes)
             n_layers = info.n_layers
             active_bytes = info.active_bytes
+            kv_bytes_per_token = info.kv_bytes_per_token()
+            context_length = info.context_length
             model_name = info.name or Path(model_path).stem
             notes.append(
                 f"model: {model_name or model_path} "
@@ -119,12 +124,28 @@ def build_workload_spec(
     spec = WorkloadSpec(
         model_bytes=model_bytes,
         active_bytes=active_bytes,
+        kv_bytes_per_token=kv_bytes_per_token,
+        mem_total_bytes=gpu_mem_total_mb * 1e6 if gpu_mem_total_mb else None,
         n_layers=n_layers,
         n_gpu_layers=n_gpu_layers,
         mem_bandwidth_gb_s=mem_bandwidth_gb_s,
         model_name=model_name,
         gpu_name=gpu_name,
     )
+
+    # VRAM budget: weights (ALL experts resident) + KV at the model's context
+    # must fit. Compute the actual headroom rather than hardcoding — the client
+    # runs weights + 30K-context KV on 24 GB.
+    if kv_bytes_per_token and gpu_mem_total_mb:
+        probe_ctx = context_length or 32768
+        fit = spec.vram_fit(probe_ctx)
+        if fit is not None:
+            verb = "fits" if fit["fits"] else "OVERFLOWS"
+            notes.append(
+                f"VRAM budget @ {probe_ctx} ctx: weights {fit['weights_gb']} GB + "
+                f"KV {fit['kv_gb']} GB (+~{fit['overhead_gb']} GB) = {fit['used_gb']} GB "
+                f"of {fit['total_gb']} GB -> {verb} ({fit['headroom_gb']} GB headroom)"
+            )
     return spec, notes
 
 
