@@ -65,6 +65,47 @@ jobs:
       - name: Run tests
         run: uv run pytest -v
 
+  # agent + web-api are not part of the client-SFF change; run their test suites
+  # for regression coverage (web-api consumes the monitor types this work
+  # extended) but do NOT gate on their pre-existing lint state.
+  agent:
+    name: agent (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/agent
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+      - name: Run tests
+        run: uv run pytest -v
+
+  web-api:
+    name: web-api (Python)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/web/api
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+      - name: Run tests
+        run: uv run pytest -v
+
   monitor:
     name: monitor (Python)
     runs-on: ubuntu-latest
