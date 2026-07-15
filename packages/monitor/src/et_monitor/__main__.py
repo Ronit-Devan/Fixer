@@ -63,6 +63,36 @@ def _build_alert_manager(args: argparse.Namespace) -> AlertManager | None:
     return AlertManager(notifiers, cfg)
 
 
+def detected_knobs(spec, gpu_reading, props) -> dict:
+    """Remediation knobs derived from auto-detected facts (pure; no I/O).
+
+    These feed the VRAM-budget validator, KV-quant skip, and power-cap logic so
+    they engage on real hardware. Only includes values that are actually known;
+    the caller fills only knobs the operator hasn't already set.
+    """
+    out: dict = {}
+    if spec is not None:
+        if getattr(spec, "model_bytes", None):
+            out["model_size_gb"] = round(spec.model_bytes / 1e9, 3)
+        if getattr(spec, "mem_total_bytes", None):
+            out["vram_total_gb"] = round(spec.mem_total_bytes / 1e9, 3)
+        if getattr(spec, "kv_bytes_per_token", None):
+            out["kv_gb_per_token"] = spec.kv_bytes_per_token / 1e9
+        if getattr(spec, "n_layers", None):
+            out["model_n_layers"] = spec.n_layers
+    if gpu_reading is not None:
+        if getattr(gpu_reading, "power_limit_w", None) is not None:
+            out["current_power_limit_w"] = gpu_reading.power_limit_w
+        if getattr(gpu_reading, "power_limit_max_w", None) is not None:
+            out["max_power_limit_w"] = gpu_reading.power_limit_max_w
+    if props is not None:
+        if getattr(props, "cache_type_k", None) is not None:
+            out["current_cache_type_k"] = props.cache_type_k
+        if getattr(props, "ctx_size", None) is not None:
+            out["ctx_size"] = props.ctx_size
+    return out
+
+
 def _build_remediation_factory(args: argparse.Namespace, monitor: Monitor):
     """Build a PER-GPU remediation manager factory, if installed and requested.
 
@@ -115,6 +145,27 @@ def _build_remediation_factory(args: argparse.Namespace, monitor: Monitor):
     # Production safety: debounce a one-tick verdict (predictive detection gives
     # the lead time to afford it). Honor a higher user-configured value.
     cfg.trigger_debounce = max(cfg.trigger_debounce, 3)
+
+    # Bridge auto-detected hardware/model facts into the remediation knobs so the
+    # VRAM-budget validator, KV-quant skip, and 70W power-cap logic actually FIRE
+    # on this box instead of silently degrading to no-ops (they only read knobs).
+    # Operator-set knobs always win — we only fill what's missing. All best-effort.
+    spec = getattr(monitor.config, "workload_spec", None)
+    reading = None
+    try:
+        gpu = getattr(monitor, "gpu", None)
+        readings = gpu.read() if gpu is not None else None
+        reading = readings[0] if readings else None
+    except Exception:  # noqa: BLE001 — bridging is best-effort, never fatal
+        reading = None
+    props = None
+    try:
+        llama = getattr(monitor, "llama", None)
+        props = llama.read_props() if (llama and hasattr(llama, "read_props")) else None
+    except Exception:  # noqa: BLE001
+        props = None
+    for knob, value in detected_knobs(spec, reading, props).items():
+        cfg.knobs.setdefault(knob, value)  # operator-set knobs win
 
     host = args.host_label or socket.gethostname()
 

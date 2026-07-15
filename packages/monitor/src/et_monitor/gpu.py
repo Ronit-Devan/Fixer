@@ -42,6 +42,11 @@ class GpuReading:
     sm_clock_mhz: int | None
     sm_clock_max_mhz: int | None
     temp_c: float | None
+    # The card's MAX enforceable power limit (NVML constraints). Distinguishes a
+    # power-capped card with headroom from a small card (70W SFF) already maxed —
+    # without it the power-limit remediation can't size a safe raise. Default None
+    # (unknown) so mock/demo samplers and tests need not supply it.
+    power_limit_max_w: float | None = None
 
     @property
     def mem_used_ratio(self) -> float | None:
@@ -165,6 +170,11 @@ class NvmlGpuSampler(GpuSampler):
         plimit = _try(
             lambda: float(nv.nvmlDeviceGetEnforcedPowerLimit(h)) / 1000.0
         )
+        # Constraints return (min, max) enforceable limits in mW; the max is what
+        # tells the remediation layer whether raising the limit is even possible.
+        plimit_max = _try(
+            lambda: float(nv.nvmlDeviceGetPowerManagementLimitConstraints(h)[1]) / 1000.0
+        )
         sm = _try(lambda: int(nv.nvmlDeviceGetClockInfo(h, nv.NVML_CLOCK_SM)))
         sm_max = _try(
             lambda: int(nv.nvmlDeviceGetMaxClockInfo(h, nv.NVML_CLOCK_SM))
@@ -184,6 +194,7 @@ class NvmlGpuSampler(GpuSampler):
             sm_clock_mhz=sm,
             sm_clock_max_mhz=sm_max,
             temp_c=temp,
+            power_limit_max_w=plimit_max,
         )
 
 
