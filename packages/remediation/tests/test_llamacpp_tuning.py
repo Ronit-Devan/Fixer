@@ -392,3 +392,43 @@ def test_power_limit_bases_on_real_current_not_a_fixed_300():
     # IT, not a fabricated 300W desktop base.
     p = _build_power_limit(_ctx(metrics={"power_limit_w": 70.0}))
     assert p["power_limit_w"] == 80  # 70 * 1.15, not ~345
+
+
+# -- VRAM-budget validation of generated flag sets (Phase 3) ------------------
+
+
+def test_restart_refuses_when_config_overflows_vram():
+    # 20 GB weights + 30K ctx KV (~0.0002 GB/tok * 30000 = 6 GB) + overhead on a
+    # 24 GB card -> ~26.6 GB > 24 -> refuse (engine advises instead of OOM).
+    import pytest
+    with pytest.raises(ValueError, match="OOM restart"):
+        _build_restart_llama(_ctx(
+            metrics={"mem_used_ratio": 0.5},
+            knobs={"model_size_gb": 20.0, "vram_total_gb": 24.0,
+                   "kv_gb_per_token": 0.0002, "ctx_size": 30000},
+        ))
+
+
+def test_restart_ok_when_config_fits_vram():
+    p = _build_restart_llama(_ctx(
+        metrics={"mem_used_ratio": 0.5},
+        knobs={"model_size_gb": 12.0, "vram_total_gb": 24.0,
+               "kv_gb_per_token": 0.0002, "ctx_size": 8000},
+    ))
+    assert p["n_gpu_layers"] == 999  # built fine, fits (~13.6 GB of 24)
+
+
+def test_vram_validation_is_noop_without_facts():
+    # No budget knobs -> can't reason -> don't block (graceful).
+    p = _build_restart_llama(_ctx(metrics={"mem_used_ratio": 0.5}))
+    assert p["cache_reuse"] == 256
+
+
+def test_spec_decode_refuses_when_draft_overflows_vram():
+    import pytest
+    with pytest.raises(ValueError, match="OOM restart"):
+        _build_spec_decode(_ctx(
+            metrics={"mem_used_ratio": 0.6},
+            knobs={"draft_model": "d.gguf", "model_size_gb": 22.0,
+                   "vram_total_gb": 24.0, "draft_size_gb": 3.0},
+        ))

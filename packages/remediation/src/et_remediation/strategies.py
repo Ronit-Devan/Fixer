@@ -140,6 +140,32 @@ def _build_restart_nccl(ctx: ActionContext) -> dict:
 _QUANTIZED_KV = frozenset({"q8_0", "q4_0", "q4_1", "q5_0", "q5_1"})
 
 
+def _assert_vram_budget(params: dict, k: dict) -> None:
+    """Refuse a generated flag set that can't fit VRAM (weights + KV (+ draft
+    model) + overhead) -> the engine falls through to advise instead of an OOM
+    restart. No-op when the facts aren't supplied as knobs (can't reason -> don't
+    block). Weights are ALL resident (every MoE expert), so use full model size.
+    """
+    vram_gb = k.get("vram_total_gb")
+    model_gb = k.get("model_size_gb")
+    if not vram_gb or not model_gb:
+        return
+    vram = float(vram_gb)
+    used = float(model_gb)
+    kv_gb_per_tok = k.get("kv_gb_per_token")
+    ctx = params.get("ctx_size") or k.get("ctx_size")
+    if kv_gb_per_tok and ctx:
+        used += float(kv_gb_per_tok) * int(ctx)
+    if params.get("model_draft"):
+        used += float(k.get("draft_size_gb", 0.0))
+    used += float(k.get("vram_overhead_gb", 0.6))
+    if used > vram:
+        raise ValueError(
+            f"generated config needs ~{used:.1f} GB VRAM but only ~{vram:.1f} GB "
+            "available; refusing to propose an OOM restart (advise instead)"
+        )
+
+
 def _has_demand(m: dict) -> bool:
     """Is there real concurrent demand to justify adding parallel slots?
 
@@ -223,6 +249,7 @@ def _build_restart_llama(ctx: ActionContext) -> dict:
     elif mem_ratio is not None and mem_ratio < 0.80:
         params["ubatch_size"] = 1024
 
+    _assert_vram_budget(params, k)  # refuse an OOM restart -> advise instead
     return params
 
 
@@ -285,6 +312,8 @@ def _build_spec_decode(ctx: ActionContext) -> dict:
     for knob in ("draft_min", "draft_p_min"):
         if k.get(knob) is not None:
             params[knob] = k[knob]
+    # The draft model must fit in VRAM ALONGSIDE the fully-resident main model.
+    _assert_vram_budget(params, k)
     return params
 
 
