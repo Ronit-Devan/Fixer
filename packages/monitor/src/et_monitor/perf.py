@@ -32,6 +32,7 @@ lookup run only at setup/startup.
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -144,7 +145,25 @@ class GgufInfo:
     architecture: str | None = None
     name: str | None = None
     n_layers: int | None = None  # <arch>.block_count
-    param_count: int | None = None  # general.parameter_count, if present
+    param_count: int | None = None  # general.parameter_count (NOT in the GGUF
+    # spec — no real GGUF carries it, so this stays None in practice; kept only
+    # for backward compat. Total params must be summed from tensors, not read.)
+    # MoE facts: total routed experts and how many fire per token.
+    expert_count: int | None = None  # <arch>.expert_count
+    expert_used_count: int | None = None  # <arch>.expert_used_count
+    # Bytes actually READ per decode token. For a dense model this equals the
+    # full weight bytes; for an MoE only expert_used_count/expert_count of the
+    # routed-expert weights are read, so this is far smaller than file_bytes.
+    # None when it can't be computed (non-MoE, or tensor block unreadable).
+    active_bytes: float | None = None
+
+    @property
+    def is_moe(self) -> bool:
+        return bool(
+            self.expert_count
+            and self.expert_used_count
+            and 0 < self.expert_used_count < self.expert_count
+        )
 
 
 def _read_gguf_string(f) -> str:
@@ -176,6 +195,63 @@ def _skip_gguf_value(f, vtype: int, depth: int = 0) -> None:
         raise ValueError(f"unknown gguf value type {vtype}")
 
 
+# A tensor is a conditionally-active ROUTED expert iff its name carries the
+# plural "_exps" suffix (blk.N.ffn_{gate,up,down,gate_up}_exps). Shared experts
+# ("_shexp") and dense FFN ("ffn_gate/up/down") run every token -> always active.
+_ROUTED_EXPERT_RE = re.compile(r"\.ffn_(?:gate|up|down|gate_up)_exps\b")
+
+
+def _estimate_active_bytes(
+    f, tensor_count: int, file_bytes: int, alignment: int, used: int, count: int
+) -> float | None:
+    """Sum per-token-read bytes for an MoE from the GGUF tensor-info block.
+
+    Uses tensor DATA OFFSETS (already encode on-disk quantized sizes) rather than
+    a ggml type-size table: size[i] = offset[i+1] - offset[i], last from the data
+    section end. active = always_active_bytes + (used/count) * routed_expert_bytes.
+    The cursor must sit at the start of the tensor-info block. Returns None on any
+    inconsistency so the caller degrades to full-weight (dense) behaviour.
+    """
+    if tensor_count <= 0 or count <= 0 or not (0 < used < count):
+        return None
+    tensors: list[tuple[str, int]] = []  # (name, data_offset)
+    for _ in range(tensor_count):
+        name = _read_gguf_string(f)
+        (n_dims,) = struct.unpack("<I", f.read(4))
+        if n_dims > 8:  # GGML_MAX_DIMS is 4; >8 means we've lost sync
+            return None
+        f.seek(8 * n_dims, 1)  # dimensions (uint64 each) — unused here
+        f.seek(4, 1)  # ggml type (uint32) — unused; offsets give sizes
+        (offset,) = struct.unpack("<Q", f.read(8))
+        tensors.append((name, offset))
+    # Data section starts after the tensor-info block, padded to `alignment`.
+    pos = f.tell()
+    align = alignment if alignment > 0 else 32
+    data_start = ((pos + align - 1) // align) * align
+    total_data = file_bytes - data_start
+    if total_data <= 0 or not tensors:
+        return None
+    ordered = sorted(tensors, key=lambda t: t[1])
+    offsets = [o for _, o in ordered]
+    if offsets[0] != 0 or offsets[-1] >= total_data:
+        return None  # offsets aren't the expected data-relative contiguous layout
+    routed = 0.0
+    for i, (name, off) in enumerate(ordered):
+        end = offsets[i + 1] if i + 1 < len(offsets) else total_data
+        size = end - off
+        if size < 0:
+            return None
+        if _ROUTED_EXPERT_RE.search(name):
+            routed += size
+    if routed <= 0:
+        return None  # no routed-expert tensors found -> not the MoE we expected
+    # Only used/count of the routed-expert bytes are read per token.
+    active = total_data - routed * (1.0 - used / count)
+    if not (0 < active <= total_data):
+        return None
+    return float(active)
+
+
 def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | None:
     """Read the few GGUF header facts we need (layer count, arch, size).
 
@@ -194,28 +270,44 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
             if version not in (2, 3):
                 # v1 used 32-bit counts; we don't bother — return size-only info.
                 return GgufInfo(path=str(p), file_bytes=file_bytes)
-            (_tensor_count,) = struct.unpack("<Q", f.read(8))
+            (tensor_count,) = struct.unpack("<Q", f.read(8))
             (kv_count,) = struct.unpack("<Q", f.read(8))
 
             arch: str | None = None
             name: str | None = None
             n_layers: int | None = None
             param_count: int | None = None
+            expert_count: int | None = None
+            expert_used: int | None = None
+            alignment = 32  # GGUF default; overridden by general.alignment if set
 
+            # Read EVERY kv (no early exit): we need expert_count/alignment which
+            # arrive late in the arch block, and we must land the cursor on the
+            # tensor-info block to size the MoE active weights. _skip_gguf_value
+            # advances by length, so tokenizer arrays cost seeks, not reads.
+            complete = kv_count <= max_kv
             for _ in range(min(kv_count, max_kv)):
                 key = _read_gguf_string(f)
                 (vtype,) = struct.unpack("<I", f.read(4))
                 if vtype in _GGUF_FIXED and (
                     key.endswith(".block_count")
+                    or key.endswith(".expert_count")
+                    or key.endswith(".expert_used_count")
                     or key == "general.parameter_count"
-                    or key == "general.architecture"  # never fixed, but be safe
+                    or key == "general.alignment"
                 ):
                     raw = f.read(_GGUF_FIXED[vtype][1])
                     (val,) = struct.unpack(_GGUF_FIXED[vtype][0], raw)
                     if key.endswith(".block_count"):
                         n_layers = int(val)
+                    elif key.endswith(".expert_used_count"):
+                        expert_used = int(val)
+                    elif key.endswith(".expert_count"):
+                        expert_count = int(val)
                     elif key == "general.parameter_count":
                         param_count = int(val)
+                    elif key == "general.alignment":
+                        alignment = int(val) or 32
                 elif vtype == _GGUF_STRING and key in (
                     "general.architecture",
                     "general.name",
@@ -227,8 +319,25 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                         name = s
                 else:
                     _skip_gguf_value(f, vtype)
-                if arch is not None and n_layers is not None:
-                    break  # have what we need; skip the tokenizer arrays entirely
+
+            # MoE active-weight sizing: only when we read the whole kv block (so
+            # the cursor is really at the tensor-info block) and the model gates
+            # experts. Isolated try/except so a tensor-block hiccup never loses
+            # the arch/layer facts we already have.
+            active_bytes: float | None = None
+            if (
+                complete
+                and expert_count
+                and expert_used
+                and 0 < expert_used < expert_count
+            ):
+                try:
+                    active_bytes = _estimate_active_bytes(
+                        f, tensor_count, file_bytes, alignment, expert_used, expert_count
+                    )
+                except (OSError, struct.error, ValueError, MemoryError, OverflowError):
+                    active_bytes = None
+
             return GgufInfo(
                 path=str(p),
                 file_bytes=file_bytes,
@@ -236,6 +345,9 @@ def read_gguf_metadata(path: str | Path, *, max_kv: int = 4000) -> GgufInfo | No
                 name=name,
                 n_layers=n_layers,
                 param_count=param_count,
+                expert_count=expert_count,
+                expert_used_count=expert_used,
+                active_bytes=active_bytes,
             )
     except (OSError, struct.error, ValueError, MemoryError, OverflowError):
         return None
@@ -254,6 +366,10 @@ class WorkloadSpec:
     """
 
     model_bytes: float | None = None  # full quantized weight bytes (~GGUF size)
+    # Bytes actually read per decode token. For MoE this is much smaller than
+    # model_bytes (only active experts stream); None/absent => dense, use full
+    # model_bytes. This is what makes the decode ceiling correct on an MoE.
+    active_bytes: float | None = None
     n_layers: int | None = None
     n_gpu_layers: int | None = None  # configured -ngl; None/<0 => treat as all
     mem_bandwidth_gb_s: float | None = None
@@ -282,9 +398,26 @@ class WorkloadSpec:
         return bool(self.model_bytes and self.mem_bandwidth_gb_s)
 
     def bytes_on_gpu(self) -> float | None:
-        if self.model_bytes is None:
+        """Bytes read from GPU per decode token, scaled by offload fraction.
+
+        Prefers ``active_bytes`` (correct for MoE: only active experts stream)
+        and falls back to full ``model_bytes`` for dense models. Scaling by
+        offload_fraction is an approximation under partial offload (some active
+        experts may spill to CPU) — but partial offload is flagged separately,
+        and at full offload (the client's case) it is exact.
+        """
+        base = self.active_bytes if self.active_bytes else self.model_bytes
+        if base is None:
             return None
-        return self.model_bytes * self.offload_fraction
+        return base * self.offload_fraction
+
+    @property
+    def is_moe(self) -> bool:
+        """True when an active-expert byte count distinct from the full model is
+        known (i.e. the roofline is using the MoE-correct decode ceiling)."""
+        return bool(
+            self.active_bytes and self.model_bytes and self.active_bytes < self.model_bytes
+        )
 
     # -- persistence ---------------------------------------------------------
 
@@ -327,6 +460,7 @@ class Roofline:
     concurrency: float | None
     partial_offload: bool
     at_bandwidth_wall: bool
+    is_moe: bool = False  # ceiling computed from active-expert bytes, not full weights
 
     def to_metrics(self) -> dict:
         """Flatten into the diagnosis ``metrics`` dict (rounded, JSON-friendly)."""
@@ -344,6 +478,7 @@ class Roofline:
             "concurrency": r(self.concurrency, 2),
             "partial_offload": self.partial_offload,
             "at_bandwidth_wall": self.at_bandwidth_wall,
+            "is_moe": self.is_moe,
         }
 
 
@@ -386,6 +521,7 @@ def roofline(
         concurrency=concurrency,
         partial_offload=partial,
         at_bandwidth_wall=at_wall,
+        is_moe=spec.is_moe,
     )
 
 

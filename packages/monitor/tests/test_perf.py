@@ -154,3 +154,130 @@ def test_roofline_degrades_without_bandwidth():
     assert r is not None
     assert r.mbu is None and r.ideal_tok_s is None
     assert r.at_bandwidth_wall is False  # never claim the wall on unknown bandwidth
+
+
+# -- MoE active-byte accounting (decode ceiling ~10x off if full weights used) --
+
+
+def _tensor_info(name: str, size: int, offset: int) -> bytes:
+    # name, n_dims=1, dims=[max(size,1)], ggml_type=0 (f32), offset
+    return (
+        _gguf_string(name)
+        + struct.pack("<I", 1)
+        + struct.pack("<Q", max(size, 1))
+        + struct.pack("<I", 0)
+        + struct.pack("<Q", offset)
+    )
+
+
+def _make_gguf_with_tensors(
+    kvs: list[tuple[str, int, bytes]], tensors: list[tuple[str, int]]
+) -> bytes:
+    # tensors: [(name, size_bytes)] laid out contiguously in the data section.
+    offsets, acc = [], 0
+    for _, sz in tensors:
+        offsets.append(acc)
+        acc += sz
+    total_data = acc
+    blob = (
+        b"GGUF"
+        + struct.pack("<I", 3)
+        + struct.pack("<Q", len(tensors))
+        + struct.pack("<Q", len(kvs))
+    )
+    for key, vtype, val in kvs:
+        blob += _gguf_string(key) + struct.pack("<I", vtype) + val
+    for (name, sz), off in zip(tensors, offsets):
+        blob += _tensor_info(name, sz, off)
+    blob += b"\x00" * ((-len(blob)) % 32)  # align data section to 32
+    blob += b"\x00" * total_data
+    return blob
+
+
+def test_moe_active_bytes_scales_by_used_over_count(tmp_path):
+    # 128 experts, 8/token. Non-expert=2GB, routed experts=8GB, total=10GB.
+    # active = 10 - 8*(1 - 8/128) = 10 - 8*0.9375 = 2.5 GB.
+    kvs = [
+        ("general.architecture", 8, _gguf_string("qwen3moe")),
+        ("qwen3moe.block_count", 4, struct.pack("<I", 48)),
+        ("qwen3moe.expert_count", 4, struct.pack("<I", 128)),
+        ("qwen3moe.expert_used_count", 4, struct.pack("<I", 8)),
+    ]
+    tensors = [
+        ("token_embd.weight", 1_000_000_000),
+        ("blk.0.attn_q.weight", 500_000_000),
+        ("blk.0.ffn_gate_inp.weight", 100_000_000),  # router, always active
+        ("blk.0.ffn_gate_shexp.weight", 400_000_000),  # shared, always active
+        ("blk.0.ffn_gate_exps.weight", 3_000_000_000),  # routed
+        ("blk.0.ffn_up_exps.weight", 3_000_000_000),  # routed
+        ("blk.0.ffn_down_exps.weight", 2_000_000_000),  # routed
+    ]
+    p = tmp_path / "moe.gguf"
+    p.write_bytes(_make_gguf_with_tensors(kvs, tensors))
+    info = read_gguf_metadata(p)
+    assert info is not None
+    assert info.expert_count == 128 and info.expert_used_count == 8
+    assert info.is_moe is True
+    assert info.n_layers == 48
+    assert info.active_bytes is not None
+    assert abs(info.active_bytes - 2.5e9) < 1e6  # ~2.5 GB, not the 10 GB file
+
+
+def test_dense_model_has_no_active_bytes(tmp_path):
+    # No expert keys -> dense -> active_bytes stays None (decode uses full weights).
+    kvs = [
+        ("general.architecture", 8, _gguf_string("llama")),
+        ("llama.block_count", 4, struct.pack("<I", 32)),
+    ]
+    tensors = [("token_embd.weight", 1_000_000_000), ("blk.0.ffn_gate.weight", 2_000_000_000)]
+    p = tmp_path / "dense.gguf"
+    p.write_bytes(_make_gguf_with_tensors(kvs, tensors))
+    info = read_gguf_metadata(p)
+    assert info is not None
+    assert info.n_layers == 32
+    assert info.is_moe is False
+    assert info.active_bytes is None
+
+
+def test_moe_missing_expert_tensors_degrades_to_none(tmp_path):
+    # Expert COUNT keys present but no *_exps tensors -> can't size it -> None,
+    # while expert_count/used are still surfaced (graceful degradation).
+    kvs = [
+        ("general.architecture", 8, _gguf_string("qwen3moe")),
+        ("qwen3moe.block_count", 4, struct.pack("<I", 4)),
+        ("qwen3moe.expert_count", 4, struct.pack("<I", 60)),
+        ("qwen3moe.expert_used_count", 4, struct.pack("<I", 4)),
+    ]
+    tensors = [("token_embd.weight", 1_000_000_000), ("blk.0.attn_q.weight", 500_000_000)]
+    p = tmp_path / "moe_bad.gguf"
+    p.write_bytes(_make_gguf_with_tensors(kvs, tensors))
+    info = read_gguf_metadata(p)
+    assert info is not None
+    assert info.expert_count == 60 and info.expert_used_count == 4
+    assert info.active_bytes is None  # no *_exps -> couldn't size, fell back
+
+
+def test_workloadspec_bytes_on_gpu_prefers_active_bytes():
+    # MoE spec: decode reads active_bytes, not the full file.
+    moe = WorkloadSpec(model_bytes=20e9, active_bytes=2e9, n_layers=48, n_gpu_layers=999)
+    assert moe.is_moe is True
+    assert moe.bytes_on_gpu() == 2e9  # full offload -> active bytes exactly
+    # Dense spec: falls back to full model bytes.
+    dense = WorkloadSpec(model_bytes=8e9, n_layers=32, n_gpu_layers=999)
+    assert dense.is_moe is False
+    assert dense.bytes_on_gpu() == 8e9
+
+
+def test_roofline_moe_ceiling_uses_active_bytes():
+    from et_monitor.perf import roofline
+
+    # 432 GB/s SFF, MoE reading ~4 GB/token -> ideal ~108 tok/s (not ~18 for a
+    # 20 GB dense-style denominator). A measured 90 tok/s is a healthy ~0.83 MBU.
+    spec = WorkloadSpec(
+        model_bytes=20e9, active_bytes=4e9, n_layers=48, n_gpu_layers=999,
+        mem_bandwidth_gb_s=432.0,
+    )
+    rl = roofline(spec, gen_tok_s=90.0)
+    assert rl is not None and rl.is_moe is True
+    assert 100 < rl.ideal_tok_s < 115  # 432e9/4e9 = 108
+    assert rl.mbu is not None and 0.7 < rl.mbu < 0.95  # healthy, not absurd >1

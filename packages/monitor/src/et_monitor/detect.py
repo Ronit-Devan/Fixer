@@ -78,16 +78,26 @@ def build_workload_spec(
             notes.append(f"llama-server: /props not reachable at {llama_url} (ok)")
 
     # 2) Read the GGUF header for layer count + size (the roofline's denominator).
+    active_bytes: float | None = None
     if model_path and Path(model_path).is_file():
         info = read_gguf_metadata(model_path)
         if info is not None:
             model_bytes = float(info.file_bytes)
             n_layers = info.n_layers
+            active_bytes = info.active_bytes
             model_name = info.name or Path(model_path).stem
             notes.append(
                 f"model: {model_name or model_path} "
                 f"({model_bytes / 1e9:.1f} GB, {n_layers or '?'} layers)"
             )
+            if info.is_moe and active_bytes:
+                # MoE: the decode ceiling is set by active-expert bytes, ~10x
+                # smaller than the file, so report both to avoid confusion.
+                notes.append(
+                    f"model is MoE: {info.expert_used_count}/{info.expert_count} "
+                    f"experts/token -> ~{active_bytes / 1e9:.1f} GB read per token "
+                    f"(decode ceiling uses this, not the {model_bytes / 1e9:.1f} GB file)"
+                )
         else:
             notes.append(f"model: {model_path} is not a readable GGUF (ok)")
     elif model_path:
@@ -108,6 +118,7 @@ def build_workload_spec(
 
     spec = WorkloadSpec(
         model_bytes=model_bytes,
+        active_bytes=active_bytes,
         n_layers=n_layers,
         n_gpu_layers=n_gpu_layers,
         mem_bandwidth_gb_s=mem_bandwidth_gb_s,
